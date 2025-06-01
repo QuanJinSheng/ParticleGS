@@ -118,7 +118,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             # Log and save
             cur_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss,
                                        testing_iterations, scene, render, (pipe, background), deform,
-                                       dataset.load2gpu_on_the_fly, opt.train_t)
+                                       dataset.load2gpu_on_the_fly, dataset.train_t)
 
             if iteration in testing_iterations:
                 if cur_psnr.item() >= best_psnr:

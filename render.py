@@ -29,7 +29,7 @@ import imageio
 import numpy as np
 import time
 
-def render_set(model_path, load2gpu_on_the_fly, name, iteration, views, gaussians, pipeline, background, deform):
+def render_set(model_path, load2gpu_on_the_fly, name, iteration, views, gaussians, pipeline, background, deform, train_t):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -40,18 +40,6 @@ def render_set(model_path, load2gpu_on_the_fly, name, iteration, views, gaussian
     makedirs(depth_path, exist_ok=True)
     total_time = 0.0
 
-    inter_psnr = 0.0
-    outer_psnr = 0.0
-    inter_ssim = 0.0
-    outer_ssim = 0.0
-    inter_lpips = 0.0
-    outer_lpips = 0.0
-    inter_cet = 0
-    outer_cet = 0
-    metric_ssim = SSIM()
-    metric_lpips = LPIPS()
-
-    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
     renderings = []
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -70,51 +58,17 @@ def render_set(model_path, load2gpu_on_the_fly, name, iteration, views, gaussian
         depth = depth / (depth.max() + 1e-5)
 
         gt = view.original_image[0:3, :, :]
-
-        if fid <= 0.75001:
-            inter_psnr += psnr(rendering, gt)
-            inter_ssim += metric_ssim(rendering.unsqueeze(0), gt.unsqueeze(0))
-            inter_lpips += metric_lpips(rendering.unsqueeze(0)*2.0-1.0, gt.unsqueeze(0)*2.0-1.0)
-            inter_cet += 1
-        else:
-            outer_psnr += psnr(rendering, gt)
-            outer_ssim += metric_ssim(rendering.unsqueeze(0), gt.unsqueeze(0))
-            outer_lpips += metric_lpips(rendering.unsqueeze(0)*2.0-1.0, gt.unsqueeze(0)*2.0-1.0)
-            outer_cet += 1
-
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
 
-        # 新增：收集视频帧（转换为numpy数组）
-        render_np = rendering.detach().cpu().numpy().transpose(1, 2, 0)  # [H, W, C]
-        renderings.append(to8b(render_np))
-
-
-    # 新增：保存视频
     video_path = os.path.join(render_path, "video.mp4")
     imageio.mimwrite(video_path, renderings, fps=30, quality=8)
 
-    if name=='test' or True:
-        def safe_divide(numerator, denominator):
-            if denominator == 0:
-                return np.array([0.0,0.0])
-            return numerator / denominator
-
-        fps = safe_divide(len(views), total_time)
-
-        inter_psnr = safe_divide(inter_psnr, inter_cet)
-        outer_psnr = safe_divide(outer_psnr, outer_cet)
-        inter_ssim = safe_divide(inter_ssim, inter_cet)
-        outer_ssim = safe_divide(outer_ssim, outer_cet)
-        inter_lpips = safe_divide(inter_lpips, inter_cet)
-        outer_lpips = safe_divide(outer_lpips, outer_cet)
-        print('PSNR:', inter_psnr.mean(), outer_psnr.mean())
-        print('SSIM:', inter_ssim.mean(), outer_ssim.mean())
-        print('LPIPS:', inter_lpips.mean(), outer_lpips.mean())
-        print("FPS:", fps)
-        with open(speed_path, "w") as f:
-            f.write("FPS: " + str(fps))
+    fps = len(views) / total_time
+    print("FPS:", fps)
+    with open(speed_path, "w") as f:
+        f.write("FPS: " + str(fps))
 
 def interpolate_time(model_path, load2gpt_on_the_fly, name, iteration, views, gaussians, pipeline, background, deform):
     render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")
@@ -371,12 +325,12 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         if not skip_train:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, "train", scene.loaded_iter,
                         scene.getTrainCameras(), gaussians, pipeline,
-                        background, deform)
+                        background, deform, dataset.train_t)
 
         if not skip_test:
             render_func(dataset.model_path, dataset.load2gpu_on_the_fly, "test", scene.loaded_iter,
                         scene.getTestCameras(), gaussians, pipeline,
-                        background, deform)
+                        background, deform, dataset.train_t)
 
 
 if __name__ == "__main__":

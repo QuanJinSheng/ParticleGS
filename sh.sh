@@ -38,8 +38,8 @@ for dataset in "${datasets[@]}"; do
 
     # 运行训练命令
     echo "正在训练 ${dataset}..."
-    python train.py -s "${source_dir}" -m "${model_dir}" --conf "${config_file}"
-    python render.py --conf "${config_file}" -m "${model_dir}"  --skip_train --iteration best
+#    python train.py -s "${source_dir}" -m "${model_dir}" --conf "${config_file}"
+    python render.py --conf "${config_file}" -m "${model_dir}"  --iteration best
 
     echo "${dataset} 训练完成！"
     echo "-------------------------"

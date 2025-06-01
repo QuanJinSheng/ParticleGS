@@ -80,6 +80,7 @@ class ModelParams(ParamGroup):
             "mlp_ratio": 4.0
         }
         self.scale_xyz = 1.0
+        self.train_t = 0.75
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -126,7 +127,6 @@ class OptimizationParams(ParamGroup):
         self.reg_after_densify = False
         self.min_opacity = 0.005
         self.data_sample = 'stack'
-        self.train_t = 0.75
         super().__init__(parser, "Optimization Parameters")
 
 
