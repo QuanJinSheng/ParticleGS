@@ -1,6 +1,9 @@
 
 # ParticleGS: Particle-Based Dynamics Modeling of 3D Gaussians for Prior-free Motion Extrapolation
 
+Our core idea is to emulate existing classical particle dynamics systems by introducing a latent vector that implicitly represents the dynamic state of Gaussian particles, thereby enabling extrapolation.
+
+
 # Demo
 
 ![](./demos/chessboard_demo.gif)
