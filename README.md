@@ -8,6 +8,7 @@ Our core idea is to emulate existing classical particle dynamics systems by intr
 
 # Demo
 More demos can be found in ./demos .
+
 ![](./demos/chessboard_demo.gif)
 
 # Install
