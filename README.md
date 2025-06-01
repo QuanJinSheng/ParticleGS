@@ -1,6 +1,8 @@
 
 # ParticleGS: Particle-Based Dynamics Modeling of 3D Gaussians for Prior-free Motion Extrapolation
 
+
+
 Our core idea is to emulate existing classical particle dynamics systems by introducing a latent vector that implicitly represents the dynamics state of Gaussian particles, thereby enabling extrapolation.
 
 
@@ -26,12 +28,13 @@ Our project structure is similar to the standard 3DGS.
 ```shell
 
 # train
-python train.py -s ./data/NVFi_datasets/InDoorObj/data/telescope -m ./output/telescope --conf ./arguments/nvfiobj/telescope
+python train.py -s ./data/NVFi_datasets/InDoorObj/data/telescope -m ./output/telescope --conf ./arguments/nvfiobj/telescope.py
 # render
-python render.py --conf ./arguments/nvfiobj/telescope -m ./output/telescope --iteration best
+python render.py --conf ./arguments/nvfiobj/telescope.py -m ./output/telescope --iteration best
 ```
+
 # Dataset
-We used the [NVFi](https://github.com/vLAR-group/NVFi) and [Dynamic 3D Gaussians](https://github.com/JonathonLuiten/Dynamic3DGaussians) datasets. Datasets can be organized as follows:
+We used the NVFi and Dynamic 3D Gaussians datasets. Datasets can be organized as follows:
 
 ```shell
 data
@@ -48,6 +51,3 @@ data
 │   └── ...
 
 ```
-
-# Acknowledgments
-We sincerely thank the authors of [NVFi](https://github.com/vLAR-group/NVFi), [Dynamic 3D Gaussians](https://github.com/JonathonLuiten/Dynamic3DGaussians), and [Grid4D](https://github.com/JiaweiXu8/Grid4D.git), whose codes and datasets were used in our work.
