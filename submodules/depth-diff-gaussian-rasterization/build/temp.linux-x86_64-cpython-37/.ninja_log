@@ -1,0 +1,6 @@
+# ninja log v5
+0	2876	1756547976643052663	/hdd2/qjs/projects/FreeGave/submodules/depth-diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-37/cuda_rasterizer/backward.o	572abbf19c103eaa
+1	2878	1756547976642052650	/hdd2/qjs/projects/FreeGave/submodules/depth-diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-37/cuda_rasterizer/forward.o	3423911d6262743a
+1	7598	1756547981358114691	/hdd2/qjs/projects/FreeGave/submodules/depth-diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-37/cuda_rasterizer/rasterizer_impl.o	c5cbbaf99e421162
+2	20761	1756547994506286313	/hdd2/qjs/projects/FreeGave/submodules/depth-diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-37/ext.o	629f0f2532100f2
+2	45123	1756548018880599371	/hdd2/qjs/projects/FreeGave/submodules/depth-diff-gaussian-rasterization/build/temp.linux-x86_64-cpython-37/rasterize_points.o	975d42d111e86f32
