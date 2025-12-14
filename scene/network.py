@@ -338,6 +338,10 @@ class ODEFunc(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim + 1, hidden_dim),
             nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
             nn.Linear(hidden_dim, input_dim))
 
     def forward(self, t: float, z: Tensor) -> Tensor:
