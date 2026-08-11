@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Environments and native builds
+.venv/
+venv/
+env/
+build/
+dist/
+*.
+*.a
+*.ninja*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+
+# Local data, checkpoints, and generated results
+dataset/
+data/
+output/
+outputs/
+checkpoints/
+loaded_models/
+wandb/
+runs/
+fps_vis/
+*.pth
+*.pt
+*.ckpt
+*.zip
+*.tar
+*.tar.gz
+
+# Rendered media and metric logs
+*.mp4
+*.avi
+*.jsonl
+speed.txt
+
+# Local tooling
+.cluster_deps/

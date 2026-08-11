@@ -1,55 +1,150 @@
+# ParticleGS
 
-# ParticleGS: Particle-Based Dynamics Modeling of 3D Gaussians for Prior-free Motion Extrapolation
+### Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation
 
-The current code corresponds to the **initial version (v1)** of ParticleGS (May 2025). Please be aware that the method has been **significantly updated**.
+Official implementation of the CVPR 2026 paper:
 
+> **ParticleGS: Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation**<br>
+> Jinsheng Quan\*, Qiaowei Miao\*, Yichao Xu, Zizhuo Lin, Ying Li, Wei Yang, Zhihui Li, Yawei Luo†<br>
+> Zhejiang University, North China University of Technology, Huazhong University of Science and Technology, and University of Science and Technology of China<br>
+> \* Equal contribution. † Corresponding author.
 
-Our core idea is to emulate existing classical particle dynamics systems by introducing a latent vector that implicitly represents the dynamics state of Gaussian particles, thereby enabling extrapolation.
+[[Paper](https://openaccess.thecvf.com/content/CVPR2026/papers/Quan_ParticleGS_Learning_Neural_Gaussian_Particle_Dynamics_from_Videos_for_Prior-free_CVPR_2026_paper.pdf)]
 
+![ParticleGS teaser](assets/teaser.png)
 
-# Demo
-More demos can be found in ./demos .
+## Overview
 
-![](./demos/chessboard_demo.gif)
+ParticleGS learns physical motion directly from multi-view videos without predefined physical equations, material labels, meshes, or simulation supervision. It treats each 3D Gaussian as a particle and models its evolution with three components:
 
-# Install
+1. **Dynamics Latent Space Encoder** — decomposes Gaussian features into per-particle static properties and initial dynamic fields.
+2. **Neural ODE Dynamics Evolver** — learns continuous-time, higher-order latent particle dynamics and integrates them with an RK4 solver.
+3. **Gaussian Kernel Space Decoder** — converts evolved particle states into translation, rotation, scale, and appearance-preserving Gaussian deformation for rendering.
 
-```shell
-git clone https://github.com/QuanJinSheng/ParticleGS.git
+The training schedule progressively performs geometry warm-up, dynamics warm-up, and joint optimization. In the paper, the first 75% of frames are used for reconstruction training and the remaining 25% for future-motion extrapolation testing.
+
+## Installation
+
+### Requirements
+
+- Linux
+- Python 3.9
+- CUDA-capable NVIDIA GPU
+- PyTorch 2.1.0 with CUDA 12.1 and cuDNN 8.9.2
+- torchvision 0.16.0 and PyTorch3D 0.7.8
+
+Create the Conda environment:
+
+```bash
+git clone https://github.com/QuanJinSheng/ParticleGS.git ParticleGS
 cd ParticleGS
 
-conda env create -f environment.yaml
-conda activate ParticleGS
-
-# require CUDA 11.8
-pip install -e ./submodules/diff-gaussian-rasterization
-pip install -e ./submodules/simple-knn
-```
-# Run
-Our project structure is similar to the standard 3DGS.
-```shell
-
-# train
-python train.py -s ./data/NVFi_datasets/InDoorObj/data/telescope -m ./output/telescope --conf ./arguments/nvfiobj/telescope.py
-# render
-python render.py --conf ./arguments/nvfiobj/telescope.py -m ./output/telescope --iteration best
+conda env create -f environment.yml
+conda activate particlegs
 ```
 
-# Dataset
-We used the NVFi and Dynamic 3D Gaussians datasets. Datasets can be organized as follows:
+Install the differentiable Gaussian rasterizer and nearest-neighbor CUDA extension:
 
-```shell
-data
-├── NVFi_datasets
-│   ├── InDoorObj/
-│   │   ├── telescope
-│   │   ├── bat
-│   │   └── ...
-│   ├── InDoorSeg
-│   │   ├── chessboard
-│   │   └── ...
-├── PanopticSports/
-│   ├── boxes
-│   └── ...
+```bash
+python -m pip install --no-build-isolation ./submodules/depth-diff-gaussian-rasterization
 
+python -m pip install --no-build-isolation ./submodules/simple-knn
 ```
+
+## Datasets
+
+
+
+For the provided Blender-style loaders, a scene normally has the following structure:
+
+```text
+dataset/
+└── DynObjects/
+    └── data/
+        └── bat/
+            ├── train/
+            ├── val/
+            ├── test/
+            ├── transforms_train.json
+            ├── transforms_val.json
+            ├── transforms_test.json
+            └── points3d.ply
+```
+
+
+## Training
+
+Run all commands from the repository root. Training jointly optimizes the 3D Gaussians and ParticleGS deformation model.
+
+### Example: Bat
+
+```bash
+python train.py --source_path dataset/DynObjects/data/bat --model_path output/dynobjects/bat --conf arguments/nvfiobj/bat.py --max_time 0.75
+```
+
+### Training multiple scenes
+
+```bash
+for scene in bat fallingball fan shark telescope whale; do
+  CUDA_VISIBLE_DEVICES=0 python train.py \
+    --source_path "dataset/DynObjects/data/${scene}" \
+    --model_path "output/dynobjects/${scene}" \
+    --conf "arguments/nvfiobj/${scene}.py" \
+    --max_time 0.75
+done
+```
+
+## Rendering and Testing
+
+The model path contains the training configuration, so `--source_path` usually does not need to be repeated during rendering.
+
+### Pretrained checkpoints
+
+Best checkpoints for Bat, Fan, Shark, Darkroom, and Chessboard are distributed with the
+[`v1.0.0` GitHub Release](https://github.com/QuanJinSheng/ParticleGS/releases/tag/v1.0.0).
+Download one scene or all scenes from the repository root:
+
+```bash
+bash scripts/download_checkpoints.sh bat
+bash scripts/download_checkpoints.sh all
+```
+
+The archives are verified with SHA-256 and extracted under `checkpoints/`. Datasets are not
+included and must be downloaded separately.
+
+### Render the best checkpoint
+
+The following command renders only the held-out future test views, corresponding to the extrapolation setting:
+
+```bash
+python render.py --model_path output/dynobjects/bat --iteration best --mode render --skip_train --skip_val
+```
+
+For the released Bat checkpoint and the standard dataset layout:
+
+```bash
+python render.py \
+  --model_path checkpoints/dynobjects/bat \
+  --source_path dataset/DynObjects/data/bat \
+  --iteration best \
+  --mode render \
+  --skip_train \
+  --skip_val
+```
+
+## Citation
+
+If you find ParticleGS useful, please cite:
+
+```bibtex
+@inproceedings{quan2026particlegs,
+  title     = {ParticleGS: Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation},
+  author    = {Quan, Jinsheng and Miao, Qiaowei and Xu, Yichao and Lin, Zizhuo and Li, Ying and Yang, Wei and Li, Zhihui and Luo, Yawei},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year      = {2026}
+}
+```
+
+## Acknowledgements
+
+This implementation builds on ideas and components from [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting), [Deformable 3D Gaussians](https://github.com/ingra14m/Deformable-3D-Gaussians), [NVFi](https://github.com/vLAR-group/NVFi), and related dynamic-scene reconstruction projects. We thank their authors for releasing their work.

@@ -4,7 +4,7 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
@@ -49,38 +49,37 @@ class ParamGroup:
 class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
-        self._source_path = ""
-        self._model_path = ""
+        self.source_path = ""
+        self.model_path = ""
         self._images = "images"
         self._resolution = -1
-        self._white_background = False
+        self.white_background = False
         self.data_device = "cuda"
         self.eval = True
         self.load2gpu_on_the_fly = False
 
-        self.grid_args = dict(
-            canonical_num_levels=16,
-            canonical_level_dim=2,
-            canonical_base_resolution=16,
-            canonical_desired_resolution=2048,
-            canonical_log2_hashmap_size=19,
-
-            deform_num_levels=32,
-            deform_level_dim=2,
-
-            bound=1.6,
+        self.encoder_config = (
+            {
+                "in_dim": 14,
+                "hidden_size": 256,
+                "num_groups": 2048,
+                "group_size": 32,
+                "query": 4,
+                "num_heads": 4,
+                "mlp_ratio": 4.0,
+                "l_dim": 32
+            },
+            {
+                "steps": 10
+            },
         )
-        self.encoder_config = {
-            "in_channels": 35,
-            "hidden_size": 128,
-            "num_groups": 2048,
-            "group_size": 32,
-            "depth": 4,
-            "num_heads": 4,
-            "mlp_ratio": 4.0
-        }
-        self.scale_xyz = 1.0
         self.train_t = 0.75
+        self.size = None
+        self.max_time = 0.75
+        self.max_train_cameras = -1
+        self.max_init_cameras = -1
+        self.max_val_cameras = -1
+        self.max_test_cameras = -1
 
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -107,8 +106,8 @@ class OptimizationParams(ParamGroup):
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 35_000
 
-        self.grid_lr_scale = 50.0
         self.network_lr_scale = 5.0
+        self.netwarm = 4000
 
         self.deform_lr_max_steps = 80_000
         self.feature_lr = 0.0025
@@ -117,6 +116,8 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_div = 0.0001
+        self.div_mode = 'sph'
         self.sreg = 0.5
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
@@ -125,8 +126,9 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.0002
         self.disable_ws_prune = False
         self.reg_after_densify = False
-        self.min_opacity = 0.005
+        self.opacity = 0.05
         self.data_sample = 'stack'
+        self.gradual = True
         super().__init__(parser, "Optimization Parameters")
 
 

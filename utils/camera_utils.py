@@ -4,14 +4,14 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
 from scene.cameras import Camera
 import numpy as np
-from utils.general_utils import PILtoTorch, ArrayToTorch
+from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 import json
 

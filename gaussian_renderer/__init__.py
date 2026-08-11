@@ -4,7 +4,7 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
@@ -14,8 +14,6 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from utils.rigid_utils import from_homogenous, to_homogenous
-from utils.general_utils import quaternion_to_matrix
 
 
 def quaternion_multiply(q1, q2):
@@ -28,6 +26,7 @@ def quaternion_multiply(q1, q2):
     z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
 
     return torch.stack((w, x, y, z), dim=-1)
+
 
 def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, scaling_modifier=1.0, override_color=None):
     """
@@ -64,13 +63,13 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    if torch.is_tensor(d_xyz):
-        means3D = pc.get_xyz + d_xyz
-    else:
-        means3D = pc.get_xyz
 
+    means3D = pc.get_xyz + d_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+
+    # filter out invisible Gaussians
+    valid = pc.filter_gaussians(viewpoint_camera, xyz=means3D.detach())
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -78,43 +77,66 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp = pc.get_covariance(scaling_modifier)[valid]
     else:
-        scales = pc.get_scaling + d_scaling
-        rotations = pc.get_rotation + d_rotation
+        if isinstance(d_scaling, float):
+            scales = pc.get_scaling
+        else:
+            scales = pc.modify_scaling(d_scaling)
+
+        if isinstance(d_rotation, float):
+            rotations = pc.get_rotation
+        else:
+            rotations = quaternion_multiply(d_rotation, pc.get_rotation)
+            # rotations = quaternion_multiply(pc.get_rotation, d_rotation)
+            # rotations = pc.get_rotation+d_rotation
+
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     shs = None
     colors_precomp = None
-    if override_color is None:
-        if colors_precomp is None:
-            if pipe.convert_SHs_python:
-                shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
-                dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-                dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-                sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-                colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
-            else:
-                shs = pc.get_features
+    if colors_precomp is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)[valid]
+        else:
+            shs = pc.get_features
+
+    if override_color is not None:
+        colors_precomp = override_color[valid]
+        shs = None
     else:
-        colors_precomp = override_color
+        shs = shs[valid]
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, depth = rasterizer(
-        means3D=means3D,
-        means2D=means2D,
+        means3D=means3D[valid],
+        means2D=means2D[valid],
         shs=shs,
         colors_precomp=colors_precomp,
-        opacities=opacity,
-        scales=scales,
-        rotations=rotations,
+        opacities=opacity[valid],
+        scales=scales[valid],
+        rotations=rotations[valid],
         cov3D_precomp=cov3D_precomp)
+
+    visibility_filter = torch.zeros_like(valid, dtype=torch.bool, device="cuda")
+    try:
+        visibility_filter[valid] = radii > 0
+    except RuntimeError:
+        print("Error in visibility filter")
+        visibility_filter[valid] = 1
+    radii_full = torch.zeros_like(valid, dtype=torch.int, device="cuda")
+    radii_full[valid] = radii
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
-            "visibility_filter": radii > 0,
-            "radii": radii,
+            "visibility_filter": visibility_filter,
+            'depth_filter': valid,
+            "radii": radii_full,
             "depth": depth}
