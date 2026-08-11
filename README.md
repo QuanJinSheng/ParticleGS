@@ -81,7 +81,7 @@ The model path contains the training configuration, so `--source_path` usually d
 
 ### Pretrained checkpoints
 
-Best checkpoints for Bat, Fan, Shark, Darkroom, and Chessboard are distributed with the
+Checkpoints for Bat, Fan, Shark, Darkroom, and Chessboard are distributed with the
 [`v1.0.0` GitHub Release](https://github.com/QuanJinSheng/ParticleGS/releases/tag/v1.0.0).
 Download one scene or all scenes from the repository root:
 
@@ -90,8 +90,6 @@ bash scripts/download_checkpoints.sh bat
 bash scripts/download_checkpoints.sh all
 ```
 
-The archives are verified with SHA-256 and extracted under `checkpoints/`. Datasets are not
-included and must be downloaded separately.
 
 ### Render the checkpoint
 
