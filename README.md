@@ -5,9 +5,9 @@
 Official implementation of the CVPR 2026 paper:
 
 > **ParticleGS: Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation**<br>
-> Jinsheng Quan\*, Qiaowei Miao\*, Yichao Xu, Zizhuo Lin, Ying Li, Wei Yang, Zhihui Li, Yawei Luo†<br>
+> Jinsheng Quan, Qiaowei Miao, Yichao Xu, Zizhuo Lin, Ying Li, Wei Yang, Zhihui Li, Yawei Luo†<br>
 > Zhejiang University, North China University of Technology, Huazhong University of Science and Technology, and University of Science and Technology of China<br>
-> \* Equal contribution. † Corresponding author.
+> † Corresponding author.
 
 [[Paper](https://openaccess.thecvf.com/content/CVPR2026/papers/Quan_ParticleGS_Learning_Neural_Gaussian_Particle_Dynamics_from_Videos_for_Prior-free_CVPR_2026_paper.pdf)]
 
@@ -27,9 +27,7 @@ The training schedule progressively performs geometry warm-up, dynamics warm-up,
 
 ### Requirements
 
-- Linux
 - Python 3.9
-- CUDA-capable NVIDIA GPU
 - PyTorch 2.1.0 with CUDA 12.1 and cuDNN 8.9.2
 - torchvision 0.16.0 and PyTorch3D 0.7.8
 
@@ -41,18 +39,13 @@ cd ParticleGS
 
 conda env create -f environment.yml
 conda activate particlegs
-```
 
-Install the differentiable Gaussian rasterizer and nearest-neighbor CUDA extension:
-
-```bash
 python -m pip install --no-build-isolation ./submodules/depth-diff-gaussian-rasterization
 
 python -m pip install --no-build-isolation ./submodules/simple-knn
 ```
 
 ## Datasets
-
 
 
 For the provided Blender-style loaders, a scene normally has the following structure:
@@ -82,18 +75,6 @@ Run all commands from the repository root. Training jointly optimizes the 3D Gau
 python train.py --source_path dataset/DynObjects/data/bat --model_path output/dynobjects/bat --conf arguments/nvfiobj/bat.py --max_time 0.75
 ```
 
-### Training multiple scenes
-
-```bash
-for scene in bat fallingball fan shark telescope whale; do
-  CUDA_VISIBLE_DEVICES=0 python train.py \
-    --source_path "dataset/DynObjects/data/${scene}" \
-    --model_path "output/dynobjects/${scene}" \
-    --conf "arguments/nvfiobj/${scene}.py" \
-    --max_time 0.75
-done
-```
-
 ## Rendering and Testing
 
 The model path contains the training configuration, so `--source_path` usually does not need to be repeated during rendering.
@@ -112,9 +93,7 @@ bash scripts/download_checkpoints.sh all
 The archives are verified with SHA-256 and extracted under `checkpoints/`. Datasets are not
 included and must be downloaded separately.
 
-### Render the best checkpoint
-
-The following command renders only the held-out future test views, corresponding to the extrapolation setting:
+### Render the checkpoint
 
 ```bash
 python render.py --model_path output/dynobjects/bat --iteration best --mode render --skip_train --skip_val
