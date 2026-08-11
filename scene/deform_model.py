@@ -1,96 +1,251 @@
-import random
-
-import einops
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from functorch import vmap, jacrev
-from torchdiffeq import odeint_adjoint as odeint
-
-from scene.network import ODE_DisplacementModel, SpaceEncoder
 import os
-from utils.system_utils import searchForMaxIteration
+import math
+
+import torch
+from pytorch3d.ops import knn_points
+
+from scene.network import ODE_DisplacementModel
 from utils.general_utils import get_expon_lr_func
+from utils.rigid_utils import exp_se3
+from utils.system_utils import searchForMaxIteration
 
 
 class DeformModel:
-    def __init__(
-            self, 
-            grid_args,
-            encoder_config,
-            scale_xyz=1.0,
-            sh_enable=False
-        ):
-        self.HashEncoder = SpaceEncoder(**grid_args).cuda()
-        self.OdeTransformer = ODE_DisplacementModel(encoder_config, ode_hidden=256).cuda()
+    def __init__(self, encoder_config):
+        self.OdeTransformer = ODE_DisplacementModel(encoder_config).cuda()
 
         self.optimizer = None
         self.network_lr_scale = 5.0
-        self.grid_lr_scale = 100.0
-
-        if type(scale_xyz) is float:
-                scale_xyz = [scale_xyz for _ in range(3)]
-        else:
-            assert len(scale_xyz) == 3
-        self.scale_xyz = torch.tensor(scale_xyz, device="cuda", dtype=torch.float32)
-
-        self.hash_lr_scheduler = None
         self.net_lr_scheduler = None
 
-        self.theta_epo = 1e-7
-        self.epsilon_v = 1e-6
-        self.v_epo = 1e-4
-        self.spatial_h_cache = None
-        self.sh_enable = sh_enable
-        
-    def step(self, xyz, t, fixed_attention=False):
-        xyz = xyz * self.scale_xyz[None, ...]
-        xyz.requires_grad_(True)
+    def _build_deform_pkg(self, feature, v, w, s, r, compute_div_loss=False, div_mode="patch"):
+        x = feature[..., :3]
+        theta = torch.norm(w, dim=-1, keepdim=True)
+        w = w / (theta + 1e-5)
+        v = v / (theta + 1e-5)
+        screw_axis = torch.cat([w, v], dim=-1)
+        transform = exp_se3(screw_axis, theta)
+        d_xyz = self.se3_transform_displacement(transform, x)
 
-        # get feature
-        if fixed_attention and self.spatial_h_cache is not None:
-            spatial_h = self.spatial_h_cache
-        else:
-            spatial_h = self.HashEncoder(xyz)
-            self.spatial_h_cache = spatial_h
-
-        x = torch.cat([xyz, spatial_h], dim=-1).unsqueeze(0)
-        mot, rs = self.OdeTransformer(x, torch.tensor([[t]], dtype=torch.float32, device='cuda'))
-        rs = rs.squeeze(0)
-        p, v, w, kv, kw, s, h = mot[..., :3], mot[..., 3:6], mot[..., 6:9], mot[..., 9:10], mot[..., 10:11], mot[..., 11:14], mot[..., 14:]
-        d_xyz = self.compute_displacement_batch(xyz.unsqueeze(0), p, v, w, kv, kw, s, h, self.sh_enable).squeeze(0)
-        rotation, scaling= rs[..., :4], rs[..., 4:]
-
-        return {
+        pkg = {
             "d_xyz": d_xyz,
-            "d_rotation": rotation, 
-            "d_scaling": scaling,
-            "mot": mot
+            "d_rotation": r,
+            "d_scaling": s,
         }
-    
+
+        if compute_div_loss:
+            pkg["div_loss"] = self.divergence_loss(
+                x.detach(), d_xyz, mode=div_mode, feature=feature.detach()
+            )
+
+        return pkg
+
+    def step(self, feature, t, infer=False, compute_div_loss=False, div_mode="patch"):
+        v, w, s, r = self.OdeTransformer(feature.unsqueeze(0), float(t), infer)
+
+        return self._build_deform_pkg(
+            feature,
+            v,
+            w,
+            s,
+            r,
+            compute_div_loss=compute_div_loss,
+            div_mode=div_mode,
+        )
+
+    def divergence_loss(
+        self,
+        xyz: torch.Tensor,
+        d_xyz: torch.Tensor,
+        mode: str = "sph",
+        n_samples: int = 512,
+        k_neighbors: int = 8,
+        feature: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if mode == "patch":
+            return self._div_loss_patch(xyz, d_xyz, n_samples)
+        if mode == "point":
+            return self._div_loss_point(xyz, d_xyz, n_samples, k_neighbors)
+        if mode == "sph":
+            return self._div_loss_sph(xyz, d_xyz, feature, n_samples, k_neighbors)
+        raise ValueError(f"div mode must be 'patch', 'point', or 'sph', got '{mode}'")
+
+    def _div_loss_patch(
+        self, xyz: torch.Tensor, d_xyz: torch.Tensor, n_patches: int
+    ) -> torch.Tensor:
+        knn_idx = self.OdeTransformer.encoder.cache_knn_idx
+        if knn_idx is None:
+            return d_xyz.new_zeros(1).squeeze()
+
+        knn_idx = knn_idx[0]
+        G, K = knn_idx.shape
+        if K < 2:
+            return d_xyz.new_zeros(1).squeeze()
+
+        N = xyz.shape[0]
+        if int(knn_idx.max()) >= N:
+            self.OdeTransformer.encoder.cache_knn_idx = None
+            return d_xyz.new_zeros(1).squeeze()
+
+        M = min(n_patches, G)
+        perm = torch.randperm(G, device=xyz.device)[:M]
+        patch_idx = knn_idx[perm]
+
+        seed_idx = patch_idx[:, 0]
+        nbr_idx = patch_idx[:, 1:]
+
+        x_seeds = xyz[seed_idx]
+        x_nbrs = xyz[nbr_idx]
+        v_seeds = d_xyz[seed_idx]
+        v_nbrs = d_xyz[nbr_idx]
+
+        dx = x_nbrs - x_seeds.unsqueeze(1)
+        dv = v_nbrs - v_seeds.unsqueeze(1)
+        dist2 = (dx * dx).sum(-1, keepdim=True).clamp(min=1e-8)
+        div_i = ((dv * dx) / dist2).sum(-1).mean(-1)
+
+        return (div_i**2).mean()
+
+    def _div_loss_point(
+        self, xyz: torch.Tensor, d_xyz: torch.Tensor, n_samples: int, k_neighbors: int
+    ) -> torch.Tensor:
+        N = xyz.shape[0]
+        M = min(n_samples, N)
+        perm = torch.randperm(N, device=xyz.device)[:M]
+
+        x_seeds = xyz[perm]
+        v_seeds = d_xyz[perm]
+
+        with torch.no_grad():
+            knn_result = knn_points(
+                x_seeds.unsqueeze(0),
+                xyz.unsqueeze(0),
+                K=k_neighbors + 1,
+                return_sorted=False,
+            )
+        knn_idx = knn_result.idx[0, :, 1:]
+
+        x_nbrs = xyz[knn_idx]
+        v_nbrs = d_xyz[knn_idx]
+
+        dx = x_nbrs - x_seeds.unsqueeze(1)
+        dv = v_nbrs - v_seeds.unsqueeze(1)
+        dist2 = (dx * dx).sum(-1, keepdim=True).clamp(min=1e-8)
+        div_i = ((dv * dx) / dist2).sum(-1).mean(-1)
+
+        return (div_i**2).mean()
+
+    def _sph_kernel_grad(
+        self, dx: torch.Tensor, h: torch.Tensor, kernel: str = "gaussian"
+    ) -> torch.Tensor:
+        if kernel == "gaussian":
+
+            r2 = (dx * dx).sum(-1, keepdim=True).clamp(min=1e-12)
+            h2 = (h * h).clamp(min=1e-12)
+            W = torch.exp(-r2 / h2)
+            return (-2.0 / h2) * dx * W
+
+        if kernel == "cubic":
+
+            r = (dx * dx).sum(-1, keepdim=True).clamp(min=1e-12).sqrt()
+            q = (r / h).clamp(max=2.0)
+            sigma = 8.0 / (math.pi * h**3)
+
+            dWdq = torch.zeros_like(r)
+            m1 = q < 1.0
+            m2 = (q >= 1.0) & (q < 2.0)
+            dWdq = torch.where(m1, sigma * q * (-3.0 + 2.25 * q), dWdq)
+            dWdq = torch.where(m2, sigma * (-0.75) * (2.0 - q) ** 2, dWdq)
+
+            return (dWdq / h) * (dx / r.clamp(min=1e-8))
+
+        raise ValueError(f"Unknown SPH kernel: '{kernel}'. Use 'gaussian' or 'cubic'.")
+
+    def _div_loss_sph(
+        self,
+        xyz: torch.Tensor,
+        d_xyz: torch.Tensor,
+        feature: torch.Tensor,
+        n_samples: int,
+        k_neighbors: int,
+        kernel: str = "gaussian",
+        h_scale: float = 1.0,
+    ) -> torch.Tensor:
+
+        knn_idx = self.OdeTransformer.encoder.cache_knn_idx
+
+        if knn_idx is not None:
+            knn_idx = knn_idx[0]
+            G = knn_idx.shape[0]
+            M = min(n_samples, G)
+            perm = torch.randperm(G, device=xyz.device)[:M]
+            patch_idx = knn_idx[perm]
+            seed_idx = patch_idx[:, 0]
+            nbr_idx = patch_idx[:, 1:]
+        else:
+            N = xyz.shape[0]
+            M = min(n_samples, N)
+            perm = torch.randperm(N, device=xyz.device)[:M]
+            seed_idx = perm
+            with torch.no_grad():
+                knn_result = knn_points(
+                    xyz[perm].unsqueeze(0),
+                    xyz.unsqueeze(0),
+                    K=k_neighbors + 1,
+                    return_sorted=False,
+                )
+            nbr_idx = knn_result.idx[0, :, 1:]
+
+        K_nbr = nbr_idx.shape[-1]
+        if K_nbr < 1:
+            return d_xyz.new_zeros(1).squeeze()
+
+        x_i = xyz[seed_idx]
+        x_j = xyz[nbr_idx]
+        v_i = d_xyz[seed_idx]
+        v_j = d_xyz[nbr_idx]
+
+        dx = x_i.unsqueeze(1) - x_j
+
+        r = dx.norm(dim=-1)
+        h = (h_scale * r.mean(dim=-1)).clamp(min=1e-6)
+        h = h.view(M, 1, 1)
+
+        if feature is not None:
+            scale_j = feature[nbr_idx, 10:13]
+            alpha_j = feature[nbr_idx, 13:14]
+            vol_j = (alpha_j * scale_j.prod(dim=-1, keepdim=True)).clamp(min=1e-8)
+        else:
+            vol_j = torch.ones(M, K_nbr, 1, device=xyz.device)
+
+        vol_j = vol_j / (vol_j.sum(dim=1, keepdim=True) + 1e-8)
+
+        grad_W = self._sph_kernel_grad(dx, h, kernel=kernel)
+
+        dv = v_j - v_i.unsqueeze(1)
+        div_i = (vol_j * (dv * grad_W).sum(dim=-1, keepdim=True)).sum(dim=1).squeeze(-1)
+
+        return (div_i**2).mean()
+
     def train_setting(self, training_args):
-        self.grid_lr_scale = training_args.grid_lr_scale
+
         self.network_lr_scale = training_args.network_lr_scale
 
         l = [
-            {'params': list(self.HashEncoder.parameters()),
-             'lr': training_args.position_lr_init * self.grid_lr_scale,
-             "name": "hash"},
-            {'params': list(self.OdeTransformer.parameters()),
-             'lr': training_args.position_lr_init * self.network_lr_scale,
-             "name": "ode"}
+            {
+                "params": list(self.OdeTransformer.parameters()),
+                "lr": training_args.position_lr_init * self.network_lr_scale,
+                "name": "ode",
+            }
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-
-        self.hash_lr_scheduler = get_expon_lr_func(lr_init=training_args.position_lr_init * self.grid_lr_scale,
-                                                   lr_final=training_args.position_lr_final * self.grid_lr_scale,
-                                                   lr_delay_mult=training_args.position_lr_delay_mult,
-                                                   max_steps=training_args.deform_lr_max_steps)
-        self.net_lr_scheduler = get_expon_lr_func(lr_init=training_args.position_lr_init * self.network_lr_scale,
-                                                  lr_final=training_args.position_lr_final * self.network_lr_scale * 0.5,
-                                                  lr_delay_mult=training_args.position_lr_delay_mult * self.network_lr_scale,
-                                                  max_steps=training_args.deform_lr_max_steps)
+        self.net_lr_scheduler = get_expon_lr_func(
+            lr_init=training_args.position_lr_init * self.network_lr_scale,
+            lr_final=training_args.position_lr_final * self.network_lr_scale * 0.5,
+            lr_delay_mult=training_args.position_lr_delay_mult * self.network_lr_scale,
+            max_steps=training_args.deform_lr_max_steps,
+        )
 
     def save_weights(self, model_path, iteration, is_best=False):
         if is_best:
@@ -101,108 +256,29 @@ class DeformModel:
         else:
             out_weights_path = os.path.join(model_path, "deform/iteration_{}".format(iteration))
             os.makedirs(out_weights_path, exist_ok=True)
-        torch.save((self.HashEncoder.state_dict(), self.OdeTransformer.state_dict()), os.path.join(out_weights_path, 'deform.pth'))
+        torch.save(self.OdeTransformer.state_dict(), os.path.join(out_weights_path, "deform.pth"))
 
     def load_weights(self, model_path, iteration=-1):
         if iteration == -1:
-            loaded_iter = searchForMaxIteration(os.path.join(model_path, "deform"))
-            weights_path = os.path.join(model_path, "deform/iteration_{}/deform.pth".format(loaded_iter))
-        else:
-            loaded_iter = iteration
-            weights_path = os.path.join(model_path, "deform/iteration_{}/deform.pth".format(loaded_iter))
+            iteration = searchForMaxIteration(os.path.join(model_path, "deform"))
+        weights_path = os.path.join(model_path, "deform/iteration_{}/deform.pth".format(iteration))
 
         print("Load weight:", weights_path)
-        hash_weight, ode_weight = torch.load(weights_path, map_location='cuda')
-        self.HashEncoder.load_state_dict(hash_weight)
+        ode_weight = torch.load(weights_path, map_location="cuda")
         self.OdeTransformer.load_state_dict(ode_weight)
 
     def update_learning_rate(self, iteration):
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "hash":
-                lr = self.hash_lr_scheduler(iteration)
-                param_group['lr'] = lr
-            elif param_group['name'] == 'ode':
+            if param_group["name"] == "ode":
                 lr = self.net_lr_scheduler(iteration)
-                param_group['lr'] = lr
+                param_group["lr"] = lr
 
-    def skew_batch(self, w):
-        """
-        Skew-symmetric matrix generation
-        Args:
-            w: Angular velocity vector (B, N, 3)
-        Returns:
-            K: Skew-symmetric matrix (B, N, 3, 3)
-        """
+    def se3_transform_displacement(self, T: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        x_de = x.detach()
+        R = T[:, :3, :3]
+        p = T[:, :3, 3]
+        x_rot = torch.bmm(R, x_de.unsqueeze(-1)).squeeze(-1)
+        x_new = x_rot + p
+        displacement = x_new - x_de
 
-        B, N, _ = w.shape
-        w_flat = w.view(-1, 3)  # (B*N, 3)
-
-        zeros = torch.zeros(B * N, 1, device=w.device)  # (B*N,1)
-
-        row1 = torch.cat([zeros, -w_flat[:, 2:], -w_flat[:, 1:2]], dim=1)
-        row2 = torch.cat([w_flat[:, 2:], zeros, -w_flat[:, 0:1]], dim=1)
-        row3 = torch.cat([-w_flat[:, 1:2], w_flat[:, 0:1], zeros], dim=1)
-        K_flat = torch.stack([row1, row2, row3], dim=1)  # (B*N, 3, 3)
-
-        return K_flat.view(B, N, 3, 3)  # (B, N, 3, 3)
-
-    def compute_displacement_batch(self, x, p, v, w, kv, kw, s, h, sh_enable):
-        """
-        Args:
-            x: Original position (B, N, 3)
-            p: Rotation origin (B, N, 3)
-            v: Linear velocity direction (B, N, 3)
-            w: Angular velocity direction (B, N, 3)
-            kv: Linear velocity magnitude (B, N, 1)
-            kw: Angular velocity magnitude (B, N, 1)
-            s: Scaling factors (B, N, 3)
-            h: Shearing factors (B, N, 3)
-            sh_enable: Whether scaling and shearing are enabled
-
-        Returns:
-            dx: Displacement x1 - x (B, N, 3)
-        """
-
-        device = x.device
-        B, N, _ = x.shape
-
-        v = v / (torch.norm(v, dim=-1, keepdim=True) + 1e-8)
-        w = w / (torch.norm(w, dim=-1, keepdim=True) + 1e-8)
-        v_actual = v * kv
-        w_actual = w * kw
-
-        theta = torch.norm(w_actual, dim=2, keepdim=True) + 1e-8
-        k = w_actual / theta
-
-        # Rodrigues
-        K = self.skew_batch(k)
-        I = torch.eye(3, device=device).view(1, 1, 3, 3).expand(B, N, 3, 3)
-        theta_flat = theta.view(B * N, 1, 1)
-        K_flat = K.view(B * N, 3, 3)
-
-        R_flat = I.view(B * N, 3, 3) + \
-                 torch.sin(theta_flat) * K_flat + \
-                 (1 - torch.cos(theta_flat)) * (K_flat @ K_flat)
-        R = R_flat.view(B, N, 3, 3)
-
-        if sh_enable:
-            S = torch.zeros(B, N, 3, 3, device=device)
-            S[:, :, 0, 0] = s[:, :, 0]
-            S[:, :, 1, 1] = s[:, :, 1]
-            S[:, :, 2, 2] = s[:, :, 2]
-
-            H = torch.eye(3, device=device).view(1, 1, 3, 3).expand(B, N, 3, 3).clone()
-            H[:, :, 0, 1] = h[:, :, 0]
-            H[:, :, 0, 2] = h[:, :, 1]
-            H[:, :, 1, 2] = h[:, :, 2]
-
-            A = torch.einsum('bnij,bnjk,bnkl->bnil', S, R, H)
-        else:
-            A = R
-
-        offset = x - p
-        transformed = torch.einsum('bnij,bnj->bni', A, offset)
-        x1 = transformed + p + v_actual
-
-        return x1 - x
-
+        return displacement

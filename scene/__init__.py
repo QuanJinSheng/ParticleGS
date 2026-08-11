@@ -4,28 +4,39 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
 
 import os
 import random
-import json
-import numpy as np
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
-from scene.deform_model import DeformModel
+from scene.deform_model import DeformModel as DeformModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.camera_utils import cameraList_from_camInfos
+
+
+def subsample_cam_infos(cam_infos, max_cameras):
+    if max_cameras is None or max_cameras <= 0 or len(cam_infos) <= max_cameras:
+        return cam_infos
+    if max_cameras == 1:
+        return [cam_infos[0]]
+
+    if max_cameras >= len(cam_infos):
+        return cam_infos
+
+    step = (len(cam_infos) - 1) / float(max_cameras - 1)
+    indices = [int(round(i * step)) for i in range(max_cameras)]
+    return [cam_infos[idx] for idx in indices]
 
 
 class Scene:
     gaussians: GaussianModel
 
-    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True,
-                 resolution_scales=[1.0]):
+    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], skip_train=False, skip_val=False, skip_test=False):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -41,13 +52,27 @@ class Scene:
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
         self.train_cameras = {}
+        self.init_cameras = {}
+        self.val_cameras = {}
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Blender"](
+                args.source_path,
+                args.white_background,
+                args.eval,
+                '.png',
+                skip_train,
+                skip_val,
+                skip_test,
+                getattr(args, "max_train_cameras", -1),
+                getattr(args, "max_init_cameras", -1),
+                getattr(args, "max_val_cameras", -1),
+                getattr(args, "max_test_cameras", -1),
+            )
         elif os.path.exists(os.path.join(args.source_path, "cameras_sphere.npz")):
             print("Found cameras_sphere.npz file, assuming DTU data set!")
             scene_info = sceneLoadTypeCallbacks["DTU"](args.source_path, "cameras_sphere.npz", "cameras_sphere.npz")
@@ -56,45 +81,46 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             print("Found calibration_full.json, assuming Neu3D data set!")
-            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24)
+            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24, skip_train=skip_train)
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found calibration_full.json, assuming Dynamic-360 data set!")
-            scene_info = sceneLoadTypeCallbacks["dynamic360"](args.source_path)
-        elif os.path.exists(os.path.join(args.source_path, "train_meta.json")):
-            print("Found train_meta.json, assuming PanopticSports data set!")
-            scene_info = sceneLoadTypeCallbacks["PanopticSports"](args.source_path)
+            scene_info = sceneLoadTypeCallbacks["partnerf"](args.source_path, args.white_background, args.eval, '.png', skip_train, skip_val, skip_test)
         else:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"),
-                                                                   'wb') as dest_file:
+            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"), 'wb') as dest_file:
                 dest_file.write(src_file.read())
-            json_cams = []
-            camlist = []
-            if scene_info.test_cameras:
-                camlist.extend(scene_info.test_cameras)
-            if scene_info.train_cameras:
-                camlist.extend(scene_info.train_cameras)
-            for id, cam in enumerate(camlist):
-                json_cams.append(camera_to_JSON(id, cam))
-            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
-                json.dump(json_cams, file)
 
         if shuffle:
-            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
-            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+            if not skip_train:
+                random.shuffle(scene_info.train_cameras) # Multi-res consistent random shuffling
+            if not skip_test:
+                random.shuffle(scene_info.test_cameras) # Multi-res consistent random shuffling
+
+        scene_info = scene_info._replace(
+            train_cameras=subsample_cam_infos(scene_info.train_cameras, getattr(args, "max_train_cameras", -1)) if not skip_train else scene_info.train_cameras,
+            init_cameras=subsample_cam_infos(scene_info.init_cameras, getattr(args, "max_init_cameras", -1)) if not skip_train else scene_info.init_cameras,
+            val_cameras=subsample_cam_infos(scene_info.val_cameras, getattr(args, "max_val_cameras", -1)) if not skip_val else scene_info.val_cameras,
+            test_cameras=subsample_cam_infos(scene_info.test_cameras, getattr(args, "max_test_cameras", -1)) if not skip_test else scene_info.test_cameras,
+        )
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
-        print("Camera radius:", self.cameras_extent, "Camera center:", scene_info.nerf_normalization['translate'])
-        print("Point bound:", np.max(scene_info.point_cloud.points, axis=0), "<->", np.min(scene_info.point_cloud.points, axis=0))
 
         for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
+            if not skip_train:
+                print("Loading Training Cameras")
+                self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
+                                                                                args)
+                self.init_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.init_cameras, resolution_scale,
                                                                             args)
-            print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale,
+            if not skip_val:
+                print("Loading Val Cameras")
+                self.val_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.val_cameras, resolution_scale,
+                                                                            args)
+            if not skip_test:
+                print("Loading Test Cameras")
+                self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale,
                                                                            args)
 
         if self.loaded_iter:
@@ -105,7 +131,6 @@ class Scene:
                                     og_number_points=len(scene_info.point_cloud.points))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
-        print("Train camera:", len(self.getTrainCameras()), "Test camera:", len(self.getTestCameras()))
 
     def save(self, iteration, is_best=False):
         if is_best:
@@ -118,8 +143,13 @@ class Scene:
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
     def getTrainCameras(self, scale=1.0):
-
         return self.train_cameras[scale]
+
+    def getInitCameras(self, scale=1.0):
+        return self.init_cameras[scale]
+
+    def getValCameras(self, scale=1.0):
+        return self.val_cameras[scale]
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]

@@ -1,0 +1,32 @@
+name: particlegs
+channels:
+  - pytorch3d
+  - bottler
+  - pytorch
+  - iopath
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.23
+  - pytorch=2.1.0
+  - torchvision=0.16.0
+  - pytorch-cuda=12.1
+  - pytorch3d=0.7.8
+  - ffmpeg=6.1.1
+  - pip=25.2
+  - setuptools=80.9.0
+  - wheel=0.45.1
+  - pip:
+      - einops==0.6.1
+      - imageio==2.27.0
+      - imageio-ffmpeg==0.5.1
+      - lpips==0.1.4
+      - ninja==1.13.0
+      - numpy==1.26.4
+      - opencv-python==3.4.18.65
+      - pillow==9.5.0
+      - plyfile==0.8.1
+      - scipy==1.11.4
+      - torchdiffeq==0.2.5
+      - tqdm==4.67.1

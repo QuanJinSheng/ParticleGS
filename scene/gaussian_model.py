@@ -4,7 +4,7 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
@@ -54,12 +54,15 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
-
-        self.densify_count = torch.empty(0)
+        self.hyper_activation = lambda x: torch.nn.functional.softmax(x, dim=-1)
+        # self.hyper_activation = lambda x: x
 
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
+
+    def modify_scaling(self, d_scaling):
+        return self.scaling_activation(self._scaling + d_scaling)
 
     @property
     def get_rotation(self):
@@ -101,6 +104,7 @@ class GaussianModel:
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
+
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
@@ -114,12 +118,15 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         self.spatial_lr_scale = 5
+        xyz_lr_scale = 0.3
 
         l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale * xyz_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
@@ -153,6 +160,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+
         return l
 
     def save_ply(self, path):
@@ -269,6 +277,8 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
+        self.xyz_gradient_accum_abs_max = self.xyz_gradient_accum_abs_max[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
@@ -281,10 +291,8 @@ class GaussianModel:
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
 
-                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)),
-                                                    dim=0)
-                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
-                                                       dim=0)
+                stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
+                stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter(
@@ -299,14 +307,15 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation):
-        d = {"xyz": new_xyz,
-             "f_dc": new_features_dc,
-             "f_rest": new_features_rest,
-             "opacity": new_opacities,
-             "scaling": new_scaling,
-             "rotation": new_rotation}
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+        d = {
+            "xyz": new_xyz,
+            "f_dc": new_features_dc,
+            "f_rest": new_features_rest,
+            "opacity": new_opacities,
+            "scaling": new_scaling,
+            "rotation": new_rotation
+        }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -316,7 +325,13 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        # self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -326,9 +341,7 @@ class GaussianModel:
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling,
-                                                        dim=1).values > self.percent_dense * scene_extent)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
@@ -343,8 +356,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
-        prune_filter = torch.cat(
-            (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
@@ -359,25 +371,22 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, disable_ws_prune=False):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-
+        # if len(self.get_xyz) < 510000:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            prune_mask = torch.logical_or(prune_mask, big_points_vs)
-            if not disable_ws_prune:
-                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-                prune_mask = torch.logical_or(prune_mask, big_points_ws)
-            self.prune_points(prune_mask)
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
 
@@ -385,6 +394,57 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
                                                              keepdim=True)
         self.denom[update_filter] += 1
+
+    def filter_gaussians(self, camera, xyz=None):
+        if xyz is None:
+            xyz = self.get_xyz
+        valid_depth = torch.ones((xyz.shape[0]), device=xyz.device, dtype=torch.bool)
+
+        if hasattr(camera, 'R'):
+            # transform points to camera space
+            R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
+            T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
+            # R is stored transposed due to 'glm' in CUDA code so we don't neet transopse here
+            xyz_cam = xyz @ R + T[None, :]
+
+            # project to screen space
+            valid_depth = xyz_cam[:, 2] > max(camera.znear, 0.02)
+
+        return valid_depth
+
+    @torch.no_grad()
+    def get_invisible_mask(self, cameras):
+        # TODO consider focal length and image width
+        xyz = self.get_xyz
+        valid_points = torch.zeros((xyz.shape[0]), device=xyz.device, dtype=torch.bool)
+
+        # we should use the focal length of the highest resolution camera
+        for camera in cameras:
+            # transform points to camera space
+            R = torch.tensor(camera.R, device=xyz.device, dtype=torch.float32)
+            T = torch.tensor(camera.T, device=xyz.device, dtype=torch.float32)
+            # R is stored transposed due to 'glm' in CUDA code so we don't neet transopse here
+            xyz_cam = xyz @ R + T[None, :]
+
+            # project to screen space
+            valid_depth = xyz_cam[:, 2] > max(1.0 * camera.znear, 0.02)
+
+            x, y, z = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
+            z = torch.clamp(z, min=0.001)
+
+            x = x / z * camera.focal_x + camera.image_width / 2.0
+            y = y / z * camera.focal_y + camera.image_height / 2.0
+
+            # in_screen = torch.logical_and(torch.logical_and(x >= 0, x < camera.image_width), torch.logical_and(y >= 0, y < camera.image_height))
+
+            # use similar tangent space filtering as in the paper
+            in_screen = torch.logical_and(
+                torch.logical_and(x >= -0.00 * camera.image_width, x <= camera.image_width * 1.00),
+                torch.logical_and(y >= -0.00 * camera.image_height, y <= 1.00 * camera.image_height))
+
+            valid = torch.logical_and(valid_depth, in_screen)
+            valid_points = torch.logical_or(valid_points, valid)
+        return ~valid_points
 
     def prune(self, max_grad, min_opacity, extent, max_screen_size):
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -403,12 +463,38 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
         torch.cuda.empty_cache()
 
-    def mot_densify(self, k, dx, extent):
-        dx = torch.max(dx, dim=-1)[0]
-        dx[dx.isnan()] = 0.0
-        dxmean = torch.mean(dx, dim=-1)
-        dx[dx < k * dxmean] = 0.0
-        print('!!')
-        self.densify_and_clone(dx, dxmean, extent)
-        self.densify_and_split(dx, dxmean, extent)
+    def save_dy_ply(self, path, dx, dr, ds):
+        def quaternion_multiply(q1, q2):
+            w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+            w2, x2, y2, z2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+
+            w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+            x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+            y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+            z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+            return torch.stack((w, x, y, z), dim=-1)
+        mkdir_p(os.path.dirname(path))
+
+        xyz = (self._xyz + dx).detach().cpu().numpy()
+        normals = np.zeros_like(xyz)
+        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        opacities = self._opacity.detach().cpu().numpy()
+        scale = (self._scaling + ds).detach().cpu().numpy()
+        rotation = quaternion_multiply(dr, self._rotation).detach().cpu().numpy()
+
+        dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(path)
+
+    def mask_op(self, min_opacity):
+        mask = self._opacity.squeeze() > min_opacity
+        low_opacity_mask = ~mask
+        self._opacity[low_opacity_mask] = 0.0
+
         torch.cuda.empty_cache()

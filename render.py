@@ -3,334 +3,284 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
+# This software is free for non-commercial, research and evaluation use
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import json
+import time
 
 import torch
-from matplotlib import pyplot as plt
 
-from scene import Scene, DeformModel
+from scene import Scene, DeformModel, GaussianModel
 import os
 from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
 import torchvision
-from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.metrics import SSIM, LPIPS
-from utils.pose_utils import pose_spherical, render_wander_path
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args, merge_config
-from gaussian_renderer import GaussianModel
+from arguments import ModelParams, PipelineParams, get_combined_args
 import imageio
 import numpy as np
-import time
 
-def render_set(model_path, load2gpu_on_the_fly, name, iteration, views, gaussians, pipeline, background, deform, train_t):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
-    speed_path = os.path.join(model_path, name, "ours_{}".format(iteration), "speed.txt")
 
-    makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
+def parse_iteration(value):
+    if value == "best":
+        return value
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError("iteration must be an integer, -1, or 'best'") from exc
+
+
+def build_gs_feature(gaussians):
+    xyz = gaussians.get_xyz.detach()
+    sh = gaussians.get_features[:, 0, :].detach()
+    r = gaussians.get_rotation.detach()
+    s = gaussians.get_scaling.detach()
+    a = gaussians.get_opacity.detach()
+    return torch.cat([xyz, sh.view(sh.size(0), -1), r, s, a], dim=1)
+
+
+def scalarize(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().item())
+    if isinstance(value, np.ndarray):
+        return float(value.mean())
+    return float(value)
+
+
+def append_metrics_log(log_path, record):
+    if not log_path:
+        return
+
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def render_set(
+    model_path,
+    load2gpu_on_the_fly,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    deform,
+    static_threshold,
+    metrics_only=False,
+):
+    render_root = os.path.join(model_path, name, f"ours_{iteration}")
+    render_path = os.path.join(render_root, "renders")
+    gts_path = os.path.join(render_root, "gt")
+    depth_path = os.path.join(render_root, "depth")
+    speed_path = os.path.join(render_root, "speed.txt")
+
+    if not metrics_only:
+        makedirs(render_path, exist_ok=True)
+        makedirs(gts_path, exist_ok=True)
+        makedirs(depth_path, exist_ok=True)
+
     total_time = 0.0
+    inter_psnr = outer_psnr = 0.0
+    inter_ssim = outer_ssim = 0.0
+    inter_lpips = outer_lpips = 0.0
+    inter_cet = outer_cet = 0
+    metric_ssim, metric_lpips = SSIM(), LPIPS()
 
-    renderings = []
+    with torch.no_grad():
+        feature = build_gs_feature(gaussians)
+        dxyz0 = deform.step(feature, 0.0)["d_xyz"]
+        static_mask = torch.ones(feature.shape[0], dtype=torch.bool, device=feature.device)
 
+        sampled_time = torch.linspace(0, 0.75, steps=75, device=feature.device)
+        for t in sampled_time:
+            dxyz_t = deform.step(feature, t)["d_xyz"]
+            displacement = (dxyz_t - dxyz0).norm(dim=-1)
+            static_mask &= displacement < static_threshold
+
+        motion_mask = ~static_mask
+
+    d_xyz = torch.zeros_like(gaussians.get_xyz)
+    d_rotation = torch.zeros_like(gaussians.get_rotation)
+    d_scaling = torch.zeros_like(gaussians.get_scaling)
+    deform_pkg = deform.step(feature, 0.0)
+    d_xyz[static_mask], d_rotation[static_mask], d_scaling[static_mask] = (
+        deform_pkg["d_xyz"][static_mask],
+        deform_pkg["d_rotation"][static_mask],
+        deform_pkg["d_scaling"][static_mask],
+    )
+
+    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
+    renderings = [] if not metrics_only else None
+
+    def update_metrics(rendering, gt, inter_flag):
+        nonlocal inter_psnr, inter_ssim, inter_lpips, inter_cet
+        nonlocal outer_psnr, outer_ssim, outer_lpips, outer_cet
+        psnr_val = psnr(rendering, gt)
+        ssim_val = metric_ssim(rendering.unsqueeze(0), gt.unsqueeze(0))
+        lpips_val = metric_lpips(rendering.unsqueeze(0) * 2.0 - 1.0, gt.unsqueeze(0) * 2.0 - 1.0)
+        if inter_flag:
+            inter_psnr += psnr_val
+            inter_ssim += ssim_val
+            inter_lpips += lpips_val
+            inter_cet += 1
+        else:
+            outer_psnr += psnr_val
+            outer_ssim += ssim_val
+            outer_lpips += lpips_val
+            outer_cet += 1
+
+    feature = build_gs_feature(gaussians)
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         if load2gpu_on_the_fly:
             view.load2device()
         fid = view.fid
-        xyz = gaussians.get_xyz
-        t = time.time()
-        deform_pkgs = deform.step(xyz.detach(), fid, fixed_attention=True)
 
-        d_xyz, d_rotation, d_scaling = deform_pkgs['d_xyz'], deform_pkgs['d_rotation'], deform_pkgs['d_scaling']
+        t_start = time.time()
+        deform_pkg = deform.step(feature, fid, True)
+        d_xyz[motion_mask], d_rotation[motion_mask], d_scaling[motion_mask] = (
+            deform_pkg["d_xyz"][motion_mask],
+            deform_pkg["d_rotation"][motion_mask],
+            deform_pkg["d_scaling"][motion_mask],
+        )
         results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling)
-        total_time += time.time() - t
-        rendering = results["render"]
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
+        total_time += time.time() - t_start
 
+        rendering, depth = results["render"], results["depth"]
+        depth = depth / (depth.max() + 1e-5)
         gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
 
-    video_path = os.path.join(render_path, "video.mp4")
-    imageio.mimwrite(video_path, renderings, fps=30, quality=8)
+        update_metrics(rendering, gt, inter_flag=(fid <= 0.75))
 
-    fps = len(views) / total_time
-    print("FPS:", fps)
-    with open(speed_path, "w") as f:
-        f.write("FPS: " + str(fps))
+        if not metrics_only:
+            torchvision.utils.save_image(rendering, os.path.join(render_path, f"{idx:05d}.png"))
+            torchvision.utils.save_image(gt, os.path.join(gts_path, f"{idx:05d}.png"))
+            torchvision.utils.save_image(depth, os.path.join(depth_path, f"{idx:05d}.png"))
 
-def interpolate_time(model_path, load2gpt_on_the_fly, name, iteration, views, gaussians, pipeline, background, deform):
-    render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")
-    depth_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "depth")
+            render_np = rendering.detach().cpu().numpy().transpose(1, 2, 0)
+            renderings.append(to8b(render_np))
 
-    makedirs(render_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
+    if not metrics_only:
+        video_path = os.path.join(render_path, "video.mp4")
+        imageio.mimwrite(video_path, renderings, fps=30, quality=8)
 
-    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
+    def safe_divide(num, den):
+        return num / den if den > 0 else np.array([0.0, 0.0])
 
-    frame = 150
-    idx = torch.randint(0, len(views), (1,)).item()
-    view = views[idx]
-    renderings = []
-    for t in tqdm(range(0, frame, 1), desc="Rendering progress"):
-        fid = torch.Tensor([t / (frame - 1)]).cuda()
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        deform_pkgs = deform.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = deform_pkgs['d_xyz'], deform_pkgs['d_rotation'], deform_pkgs['d_scaling']
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling)
-        rendering = results["render"]
-        renderings.append(to8b(rendering.cpu().numpy()))
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
+    fps_val = safe_divide(len(views), total_time)
+    all_psnr = safe_divide(inter_psnr + outer_psnr, inter_cet + outer_cet)
+    all_ssim = safe_divide(inter_ssim + outer_ssim, inter_cet + outer_cet)
+    all_lpips = safe_divide(inter_lpips + outer_lpips, inter_cet + outer_cet)
 
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(t) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(t) + ".png"))
+    summary = {
+        "all_psnr": scalarize(all_psnr.mean()),
+        "all_ssim": scalarize(all_ssim.mean()),
+        "all_lpips": scalarize(all_lpips.mean()),
+        "interp_psnr": scalarize(safe_divide(inter_psnr, inter_cet).mean()),
+        "extrap_psnr": scalarize(safe_divide(outer_psnr, outer_cet).mean()),
+        "interp_ssim": scalarize(safe_divide(inter_ssim, inter_cet).mean()),
+        "extrap_ssim": scalarize(safe_divide(outer_ssim, outer_cet).mean()),
+        "interp_lpips": scalarize(safe_divide(inter_lpips, inter_cet).mean()),
+        "extrap_lpips": scalarize(safe_divide(outer_lpips, outer_cet).mean()),
+        "fps": scalarize(fps_val),
+        "gaussian_num": int(len(gaussians.get_xyz.detach())),
+        "num_views": int(len(views)),
+        "interp_count": int(inter_cet),
+        "extrap_count": int(outer_cet),
+        "metrics_only": bool(metrics_only),
+    }
 
-    renderings = np.stack(renderings, 0).transpose(0, 2, 3, 1)
-    imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
+    print("all", summary["all_psnr"], summary["all_ssim"], summary["all_lpips"])
+    print("PSNR:", summary["interp_psnr"], summary["extrap_psnr"])
+    print("SSIM:", summary["interp_ssim"], summary["extrap_ssim"])
+    print("LPIPS:", summary["interp_lpips"], summary["extrap_lpips"])
+    print("FPS:", summary["fps"])
+    print("Gaussian num:", summary["gaussian_num"])
 
+    if not metrics_only:
+        with open(speed_path, "w") as f:
+            f.write("FPS: " + str(summary["fps"]))
 
-def interpolate_view(model_path, load2gpt_on_the_fly, name, iteration, views, gaussians, pipeline, background, timer):
-    render_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "renders")
-    depth_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "depth")
-    # acc_path = os.path.join(model_path, name, "interpolate_view_{}".format(iteration), "acc")
-
-    makedirs(render_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
-    # makedirs(acc_path, exist_ok=True)
-
-    frame = 150
-    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-
-    idx = torch.randint(0, len(views), (1,)).item()
-    view = views[idx]  # Choose a specific time for rendering
-
-    render_poses = torch.stack(render_wander_path(view), 0)
-    # render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180, 180, frame + 1)[:-1]],
-    #                            0)
-
-    renderings = []
-    for i, pose in enumerate(tqdm(render_poses, desc="Rendering progress")):
-        fid = view.fid
-
-        matrix = np.linalg.inv(np.array(pose))
-        R = -np.transpose(matrix[:3, :3])
-        R[:, 0] = -R[:, 0]
-        T = -matrix[:3, 3]
-
-        view.reset_extrinsic(R, T)
-
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        deform_pkgs = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = deform_pkgs['d_xyz'], deform_pkgs['d_rotation'], deform_pkgs['d_scaling']
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling)
-        rendering = results["render"]
-        renderings.append(to8b(rendering.cpu().numpy()))
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
-        # acc = results["acc"]
-
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(i) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(i) + ".png"))
-        # torchvision.utils.save_image(acc, os.path.join(acc_path, '{0:05d}'.format(i) + ".png"))
-
-    renderings = np.stack(renderings, 0).transpose(0, 2, 3, 1)
-    imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
+    return summary
 
 
-def interpolate_all(model_path, load2gpt_on_the_fly, name, iteration, views, gaussians, pipeline, background, deform):
-    render_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "renders")
-    depth_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "depth")
+def render_sets(
+    dataset: ModelParams,
+    iteration,
+    pipeline: PipelineParams,
+    skip_train: bool,
+    skip_val: bool,
+    skip_test: bool,
+    mode: str,
+    static_threshold=0.00,
+    fps=60,
+    eval_name=None,
+    metrics_log=None,
+    metrics_only=False,
+):
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(
+        dataset,
+        gaussians,
+        load_iteration=iteration,
+        shuffle=False,
+        skip_train=skip_train,
+        skip_val=skip_val,
+        skip_test=skip_test,
+    )
+    deform = DeformModel(dataset.encoder_config)
+    deform.load_weights(dataset.model_path, iteration=iteration)
 
-    makedirs(render_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    frame = 150
-    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180, 180, frame + 1)[:-1]],
-                               0)
-    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
+    metrics = None
 
-    idx = torch.randint(0, len(views), (1,)).item()
-    view = views[idx]  # Choose a specific time for rendering
+    if not skip_test:
+        eval_views = scene.getTestCameras()
+        if not skip_val:
+            eval_views = eval_views + scene.getValCameras()
+        run_name = eval_name or "test"
 
-    renderings = []
-    for i, pose in enumerate(tqdm(render_poses, desc="Rendering progress")):
-        fid = torch.Tensor([i / (frame - 1)]).cuda()
+        with torch.no_grad():
+            metrics = render_set(
+                dataset.model_path,
+                dataset.load2gpu_on_the_fly,
+                run_name,
+                scene.loaded_iter,
+                eval_views,
+                gaussians,
+                pipeline,
+                background,
+                deform,
+                static_threshold,
+                metrics_only=metrics_only,
+            )
 
-        matrix = np.linalg.inv(np.array(pose))
-        R = -np.transpose(matrix[:3, :3])
-        R[:, 0] = -R[:, 0]
-        T = -matrix[:3, 3]
-
-        view.reset_extrinsic(R, T)
-
-        xyz = gaussians.get_xyz
-        # time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        deform_pkgs = deform.step(xyz.detach(), fid, fixed_attention=True)
-        d_xyz, d_rotation, d_scaling = deform_pkgs['d_xyz'], deform_pkgs['d_rotation'], deform_pkgs['d_scaling']
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling)
-        rendering = results["render"]
-        renderings.append(to8b(rendering.cpu().numpy()))
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
-
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(i) + ".png"))
-        torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(i) + ".png"))
-
-    renderings = np.stack(renderings, 0).transpose(0, 2, 3, 1)
-    imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
-
-
-def interpolate_poses(model_path, load2gpt_on_the_fly, name, iteration, views, gaussians, pipeline, background, timer):
-    render_path = os.path.join(model_path, name, "interpolate_pose_{}".format(iteration), "renders")
-    depth_path = os.path.join(model_path, name, "interpolate_pose_{}".format(iteration), "depth")
-
-    makedirs(render_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
-    # makedirs(acc_path, exist_ok=True)
-    frame = 520
-    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-
-    idx = torch.randint(0, len(views), (1,)).item()
-    view_begin = views[0]  # Choose a specific time for rendering
-    view_end = views[-1]
-    view = views[idx]
-
-    R_begin = view_begin.R
-    R_end = view_end.R
-    t_begin = view_begin.T
-    t_end = view_end.T
-
-    renderings = []
-    for i in tqdm(range(frame), desc="Rendering progress"):
-        fid = view.fid
-
-        ratio = i / (frame - 1)
-
-        R_cur = (1 - ratio) * R_begin + ratio * R_end
-        T_cur = (1 - ratio) * t_begin + ratio * t_end
-
-        view.reset_extrinsic(R_cur, T_cur)
-
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        deform_pkgs = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = deform_pkgs['d_xyz'], deform_pkgs['d_rotation'], deform_pkgs['d_scaling']
-
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling)
-        rendering = results["render"]
-        renderings.append(to8b(rendering.cpu().numpy()))
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
-
-    renderings = np.stack(renderings, 0).transpose(0, 2, 3, 1)
-    imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=60, quality=8)
-
-
-def interpolate_view_original(model_path, load2gpt_on_the_fly, name, iteration, views, gaussians, pipeline, background,
-                              timer):
-    render_path = os.path.join(model_path, name, "interpolate_hyper_view_{}".format(iteration), "renders")
-    depth_path = os.path.join(model_path, name, "interpolate_hyper_view_{}".format(iteration), "depth")
-    # acc_path = os.path.join(model_path, name, "interpolate_all_{}".format(iteration), "acc")
-
-    makedirs(render_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
-
-    frame = 1000
-    to8b = lambda x: (255 * np.clip(x, 0, 1)).astype(np.uint8)
-
-    R = []
-    T = []
-    for view in views:
-        R.append(view.R)
-        T.append(view.T)
-
-    view = views[0]
-    renderings = []
-    for i in tqdm(range(frame), desc="Rendering progress"):
-        fid = torch.Tensor([i / (frame - 1)]).cuda()
-
-        query_idx = i / frame * len(views)
-        begin_idx = int(np.floor(query_idx))
-        end_idx = int(np.ceil(query_idx))
-        if end_idx == len(views):
-            break
-        view_begin = views[begin_idx]
-        view_end = views[end_idx]
-        R_begin = view_begin.R
-        R_end = view_end.R
-        t_begin = view_begin.T
-        t_end = view_end.T
-
-        ratio = query_idx - begin_idx
-
-        R_cur = (1 - ratio) * R_begin + ratio * R_end
-        T_cur = (1 - ratio) * t_begin + ratio * t_end
-
-        view.reset_extrinsic(R_cur, T_cur)
-
-        xyz = gaussians.get_xyz
-        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        deform_pkgs = timer.step(xyz.detach(), time_input)
-        d_xyz, d_rotation, d_scaling = deform_pkgs['d_xyz'], deform_pkgs['d_rotation'], deform_pkgs['d_scaling']
-
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling)
-        rendering = results["render"]
-        renderings.append(to8b(rendering.cpu().numpy()))
-        depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
-
-    renderings = np.stack(renderings, 0).transpose(0, 2, 3, 1)
-    imageio.mimwrite(os.path.join(render_path, 'video.mp4'), renderings, fps=30, quality=8)
-
-
-def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, skip_train: bool, skip_test: bool,
-                mode: str):
-    with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        deform = DeformModel(dataset.grid_args, dataset.encoder_config, scale_xyz=dataset.scale_xyz)
-        deform.load_weights(dataset.model_path, iteration=iteration)
-        deform.reg_vel = False
-
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-        if mode == "render":
-            render_func = render_set
-        elif mode == "time":
-            render_func = interpolate_time
-        elif mode == "view":
-            render_func = interpolate_view
-        elif mode == "pose":
-            render_func = interpolate_poses
-        elif mode == "original":
-            render_func = interpolate_view_original
-        else:
-            render_func = interpolate_all
-
-        if not skip_train:
-            render_func(dataset.model_path, dataset.load2gpu_on_the_fly, "train", scene.loaded_iter,
-                        scene.getTrainCameras(), gaussians, pipeline,
-                        background, deform, dataset.train_t)
-
-        if not skip_test:
-            render_func(dataset.model_path, dataset.load2gpu_on_the_fly, "test", scene.loaded_iter,
-                        scene.getTestCameras(), gaussians, pipeline,
-                        background, deform, dataset.train_t)
+    if metrics is not None:
+        record = {
+            "model_path": dataset.model_path,
+            "source_path": dataset.source_path,
+            "iteration": scene.loaded_iter,
+            "mode": mode,
+            "eval_name": eval_name or "test",
+            "skip_train": bool(skip_train),
+            "skip_val": bool(skip_val),
+            "skip_test": bool(skip_test),
+        }
+        record.update(metrics)
+        append_metrics_log(metrics_log, record)
+        if metrics_log:
+            print(f"Metrics log saved to {metrics_log}")
 
 
 if __name__ == "__main__":
@@ -338,22 +288,31 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
-    parser.add_argument("--iteration", default=-1)
+    parser.add_argument("--iteration", default=-1, type=parse_iteration)
     parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument('--conf', type=str, default=None)
+    parser.add_argument("--skip_val", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
+    parser.add_argument("--mode", default="render", choices=["render"])
+    parser.add_argument("--static_threshold", default=0.00, type=float)
+    parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument("--eval_name", type=str, default=None)
+    parser.add_argument("--metrics_log", type=str, default=None)
+    parser.add_argument("--metrics_only", action="store_true")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
-    if args.conf is not None and os.path.exists(args.conf):
-        print("Find Config:", args.conf)
-        args = merge_config(args, args.conf)
-
-    # Initialize system state (RNG)
-    safe_state(args.quiet)
-    args.data_device = 'cuda:0' if args.data_device == 'cuda' else args.data_device
-    torch.cuda.set_device(args.data_device)
-
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.mode)
+    render_sets(
+        model.extract(args),
+        args.iteration,
+        pipeline.extract(args),
+        args.skip_train,
+        args.skip_val,
+        args.skip_test,
+        args.mode,
+        args.static_threshold,
+        args.fps,
+        eval_name=getattr(args, "eval_name", None),
+        metrics_log=getattr(args, "metrics_log", None),
+        metrics_only=args.metrics_only,
+    )

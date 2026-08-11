@@ -1,5 +1,4 @@
 import concurrent.futures
-import gc
 import glob
 import os
 
@@ -8,8 +7,6 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from torchvision import transforms as T
-from tqdm import tqdm
 
 
 def normalize(v):
@@ -224,6 +221,7 @@ class Neural3D_NDC_Dataset(Dataset):
         eval_step=1,
         eval_index=0,
         sphere_scale=1.0,
+        maxt=1.0
     ):
         self.img_wh = (
             int(1352 / downsample),
@@ -249,9 +247,10 @@ class Neural3D_NDC_Dataset(Dataset):
         self.white_bg = False
         self.ndc_ray = True
         self.depth_data = False
+        self.maxt = maxt
 
         self.load_meta()
-        print(f"meta data loaded, total image:{len(self)}")
+
 
     def load_meta(self):
         """
@@ -293,73 +292,81 @@ class Neural3D_NDC_Dataset(Dataset):
                 poses_i_train.append(i)
         self.poses = poses[poses_i_train]
         self.poses_all = poses
-        self.image_paths, self.image_poses, self.image_times, N_cam, N_time = self.load_images_path(videos, self.split)
+        self.image_paths, self.image_poses, self.image_times, N_cam, N_time = self.load_images_path(videos, self.split, self.maxt)
         self.cam_number = N_cam
         self.time_number = N_time
 
-    def load_images_path(self,videos,split):
+    def load_images_path(self, videos, split, maxt=1.0):
         image_paths = []
         image_poses = []
         image_times = []
         N_cams = 0
         N_time = 0
-        countss = 300
+        countss = 193
+
         for index, video_path in enumerate(videos):
-            
             if index == self.eval_index:
-                if split =="train":
+                if split == "train":
                     continue
             else:
                 if split == "test":
                     continue
-            N_cams +=1
+
+            N_cams += 1
             count = 0
             video_images_path = video_path.split('.')[0]
-            image_path = os.path.join(video_images_path,"images")
+            image_path = os.path.join(video_images_path, "images")
             video_frames = cv2.VideoCapture(video_path)
+
             if not os.path.exists(image_path):
                 print(f"no images saved in {image_path}, extract images from video.")
                 os.makedirs(image_path)
                 this_count = 0
                 while video_frames.isOpened():
                     ret, video_frame = video_frames.read()
-                    if this_count >= countss:break
+                    if this_count >= countss: break
                     if ret:
                         video_frame = cv2.cvtColor(video_frame, cv2.COLOR_BGR2RGB)
                         video_frame = Image.fromarray(video_frame)
                         if self.downsample != 1.0:
-
                             img = video_frame.resize(self.img_wh, Image.LANCZOS)
-                        img.save(os.path.join(image_path,"%04d.png"%count))
-
-                        # img = transform(img)
+                        img.save(os.path.join(image_path, "%04d.png" % count))
                         count += 1
-                        this_count+=1
+                        this_count += 1
                     else:
                         break
-                    
+
             images_path = os.listdir(image_path)
             images_path.sort()
-            this_count = 0
-            for idx, path in enumerate(images_path):
-                if this_count >=countss:break
-                image_paths.append(os.path.join(image_path,path))
-                pose = np.array(self.poses_all[index])
-                R = pose[:3,:3]
-                R = -R
-                R[:,0] = -R[:,0]
-                T = -pose[:3,3].dot(R)
-                image_times.append(idx/countss)
-                image_poses.append((R,T))
-                # if self.downsample != 1.0:
-                #     img = video_frame.resize(self.img_wh, Image.LANCZOS)
-                # img.save(os.path.join(image_path,"%04d.png"%count))
-                this_count+=1
-            N_time = len(images_path)
+            valid_count = min(len(images_path), countss)
 
-                #     video_data_save[count] = img.permute(1,2,0)
-                #     count += 1
+            for idx, path in enumerate(images_path[:valid_count]):
+
+
+                pose = np.array(self.poses_all[index])
+                R = pose[:3, :3]
+                R = -R
+                R[:, 0] = -R[:, 0]
+                T = -pose[:3, 3].dot(R)
+
+                # ✅ 归一化到 [0, 1)
+                if valid_count > 1:
+                    t = idx / (valid_count - 1)
+                else:
+                    t = 0.0
+
+                if t<=maxt:
+                    # continue
+                    image_paths.append(os.path.join(image_path, path))
+                    image_times.append(t)
+                    image_poses.append((R, T))
+                # else:
+                #     print("n")
+
+            N_time = valid_count
+
         return image_paths, image_poses, image_times, N_cams, N_time
+
     def __len__(self):
         return len(self.image_paths)
     def __getitem__(self,index):
@@ -368,4 +375,3 @@ class Neural3D_NDC_Dataset(Dataset):
         return img, self.image_poses[index], self.image_times[index]
     def load_pose(self,index):
         return self.image_poses[index]
-

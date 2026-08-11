@@ -4,7 +4,7 @@
 # All rights reserved.
 #
 # This software is free for non-commercial, research and evaluation use
-# under the terms of the LICENSE.md file.
+# under the terms of the LICENSE file.
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
@@ -12,9 +12,11 @@
 import os
 import sys
 
-import torch
 from PIL import Image
 from typing import NamedTuple, Optional
+
+from tqdm import tqdm
+
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -28,8 +30,6 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.camera_utils import camera_nerfies_from_JSON
-from tqdm import tqdm
-from diff_gaussian_rasterization import GaussianRasterizationSettings as Camera
 
 
 class CameraInfo(NamedTuple):
@@ -39,6 +39,7 @@ class CameraInfo(NamedTuple):
     FovY: np.array
     FovX: np.array
     image: np.array
+    alpha_mask: np.array
     image_path: str
     image_name: str
     width: int
@@ -50,9 +51,22 @@ class CameraInfo(NamedTuple):
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
+    init_cameras: list
+    val_cameras: list
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+
+
+def subsample_items(items, max_items):
+    if max_items is None or max_items <= 0 or len(items) <= max_items:
+        return items
+    if max_items == 1:
+        return [items[0]]
+
+    step = (len(items) - 1) / float(max_items - 1)
+    indices = [int(round(i * step)) for i in range(max_items)]
+    return [items[idx] for idx in indices]
 
 
 def load_K_Rt_from_P(filename, P=None):
@@ -151,7 +165,10 @@ def fetchPly(path):
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'],
                        vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    try:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    except:
+        normals = np.zeros_like(colors)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 
@@ -224,22 +241,29 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     return scene_info
 
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png",
+                              max_cameras: int = -1):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
         fovx = contents["camera_angle_x"]
 
-        frames = contents["frames"]
+        frames = subsample_items(contents["frames"], max_cameras)
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
             frame_time = frame['time']
 
-            matrix = np.linalg.inv(np.array(frame["transform_matrix"]))
-            R = -np.transpose(matrix[:3, :3])
-            R[:, 0] = -R[:, 0]
-            T = -matrix[:3, 3]
+
+            # NeRF 'transform_matrix' is a camera-to-world transform
+            c2w = np.array(frame["transform_matrix"])
+            # change from OpenGL/Blender camera axes (Y-up, Z-back) to COLMAP (Y-Down, Z-forward)
+            c2w[:3, 1:3] *= -1
+
+            # get the world-to-camera transform and set R, T
+            w2c = np.linalg.inv(c2w)
+            R = np.transpose(w2c[:3, :3])
+            T = w2c[:3, 3]
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
@@ -253,48 +277,66 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             norm_data = im_data / 255.0
             mask = norm_data[..., 3:4]
 
-            arr = norm_data[:, :, :3] * norm_data[:, :,
-                                                  3:4] + bg * (1 - norm_data[:, :, 3:4])
+            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(
                 np.array(arr * 255.0, dtype=np.byte), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovx
-            FovX = fovy
+            FovY = fovy
+            FovX = fovx
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                                        image_path=image_path, image_name=image_name, width=image.size[
-                                            0],
-                                        height=image.size[1], fid=frame_time))
+                                        image_path=image_path, image_name=image_name, width=image.size[0],
+                                        height=image.size[1], fid=frame_time, alpha_mask=mask))
 
     return cam_infos
 
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
-    print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(
-        path, "transforms_train.json", white_background, extension)
-    print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(
-        path, "transforms_test.json", white_background, extension)
 
-    if not eval:
-        train_cam_infos.extend(test_cam_infos)
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", skip_train=False,
+                          skip_val=False, skip_test=False, max_train_cameras=-1,
+                          max_init_cameras=-1, max_val_cameras=-1, max_test_cameras=-1):
+    if not skip_train:
+        print("Reading Training Transforms")
+        train_cam_infos = readCamerasFromTransforms(
+            path, "transforms_train.json", white_background, extension, max_cameras=max_train_cameras)
+        init_cam_infos = [cam_info for cam_info in train_cam_infos if cam_info.fid == 0.]
+        init_cam_infos = subsample_items(init_cam_infos, max_init_cameras)
+    else:
+        init_cam_infos = []
+        train_cam_infos = []
+    if not skip_val:
+        print("Reading Val Transforms")
+        val_cam_infos = readCamerasFromTransforms(
+            path, "transforms_val.json", white_background, extension, max_cameras=max_val_cameras)
+    else:
+        val_cam_infos = []
+    if not skip_test:
+        print("Reading Test Transforms")
+        test_cam_infos = readCamerasFromTransforms(
+            path, "transforms_test.json", white_background, extension, max_cameras=max_test_cameras)
+    else:
         test_cam_infos = []
 
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-    # num_pts = 100_0
-    # print(f"Generating random point cloud ({num_pts})...")
-    #
-    # # We create random points inside the bounds of the synthetic Blender scenes
-    # xyz = np.random.random((num_pts, 3)) * 2.6 - np.array([1.3, 1.3, 0.5])
-    ply_path = os.path.join(path, "points3d.ply")
-    if  os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
 
-        xyz = np.random.random((num_pts, 3)) * 2.6 - np.array([1.3,1.3,1.3])
+    if not skip_train:
+        nerf_normalization = getNerfppNorm(train_cam_infos)
+    elif not skip_val:
+        nerf_normalization = getNerfppNorm(val_cam_infos)
+    else:
+        nerf_normalization = getNerfppNorm(test_cam_infos)
+
+    ply_path = os.path.join(path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 50_000
+        print(f"Generating random point cloud ({num_pts}) [BLENDER]...")
+
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3))
+        xyz[..., 0] = xyz[..., 0] * 30 - 15
+        xyz[..., 1] = xyz[..., 1] * 18 - 9
+        xyz[..., 2] = xyz[..., 2] * 7 - 3.5
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
             shs), normals=np.zeros((num_pts, 3)))
@@ -307,6 +349,8 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
+                           init_cameras=init_cam_infos,
+                           val_cameras=val_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
@@ -319,7 +363,6 @@ def readDTUCameras(path, render_camera, object_camera):
     masks_lis = sorted(glob(os.path.join(path, 'mask/*.png')))
     n_images = len(images_lis)
     cam_infos = []
-    cam_idx = 0
     for idx in range(0, n_images):
         image_path = images_lis[idx]
         image = np.array(Image.open(image_path))
@@ -379,11 +422,11 @@ def readNeuSDTUInfo(path, render_camera, object_camera):
     ply_path = os.path.join(path, "points3d.ply")
     if not os.path.exists(ply_path):
         # Since this data set has no colmap data, we start with random points
-        num_pts = 100_0
+        num_pts = 100_000
         print(f"Generating random point cloud ({num_pts})...")
 
         # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - np.array([1.3, 1.3, 0.5])
+        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
             shs), normals=np.zeros((num_pts, 3)))
@@ -413,23 +456,23 @@ def readNerfiesCameras(path):
     coord_scale = scene_json['scale']
     scene_center = scene_json['center']
 
-    if 'vrig' in path:
+    name = path.split('/')[-2]
+    if name.startswith('vrig'):
         train_img = dataset_json['train_ids']
         val_img = dataset_json['val_ids']
         all_img = train_img + val_img
-        ratio = 0.5
-    elif 'interp' in path:
+        ratio = 0.25
+    elif name.startswith('NeRF'):
+        train_img = dataset_json['train_ids']
+        val_img = dataset_json['val_ids']
+        all_img = train_img + val_img
+        ratio = 1.0
+    elif name.startswith('interp'):
         all_id = dataset_json['ids']
         train_img = all_id[::4]
         val_img = all_id[2::4]
         all_img = train_img + val_img
         ratio = 0.5
-    elif 'nerf' in path:
-        train_img = dataset_json['train_ids']
-        val_img = dataset_json['val_ids']
-        all_img = train_img + val_img
-        ratio = 1.0
-        print("Assuming NeRF-DS dataset!")
     else:  # for hypernerf
         train_img = dataset_json['ids'][::4]
         all_img = train_img
@@ -437,12 +480,9 @@ def readNerfiesCameras(path):
 
     train_num = len(train_img)
 
-    all_cam = [meta_json[i]['camera_id'] for i in all_img]
     all_time = [meta_json[i]['time_id'] for i in all_img]
     max_time = max(all_time)
     all_time = [meta_json[i]['time_id'] / max_time for i in all_img]
-    selected_time = set(all_time)
-    print(len(selected_time))
 
     # all poses
     all_cam_params = []
@@ -493,10 +533,9 @@ def readNerfiesInfo(path, eval):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "points3d_.ply")
-    # ply_path = os.path.join(path, "points3D_downsample.ply")
+    ply_path = os.path.join(path, "points3d.ply")
     if not os.path.exists(ply_path):
-        print(f"Generating point cloud from nerfies...")
+        print("Generating point cloud from nerfies...")
 
         xyz = np.load(os.path.join(path, "points.npy"))
         xyz = (xyz - scene_center) * scene_scale
@@ -506,12 +545,8 @@ def readNerfiesInfo(path, eval):
             shs), normals=np.zeros((num_pts, 3)))
 
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
-    else:
-        print("Find sfm point cloud:", ply_path)
-
     try:
         pcd = fetchPly(ply_path)
-        print("Load sfm point cloud from:", ply_path)
     except:
         pcd = None
 
@@ -534,7 +569,7 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
     n_cameras = poses.shape[0]
     poses = np.concatenate(
         [poses[..., 1:2], -poses[..., :1], poses[..., 2:4]], -1)
-    
+
     bottoms = np.array([0, 0, 0, 1]).reshape(
         1, -1, 4).repeat(poses.shape[0], axis=0)
     poses = np.concatenate([poses, bottoms], axis=1)
@@ -574,6 +609,7 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
 def format_infos(dataset):
     # loading
     cameras = []
+    print(f"meta data loaded, total image:{len(dataset)}")
     for idx, (image, poses, time) in enumerate(tqdm(dataset, desc="Loading Neu3D")):
         image_path = dataset.image_paths[idx]
         image_name = '%04d.png' % idx
@@ -582,12 +618,13 @@ def format_infos(dataset):
         FovX = focal2fov(dataset.focal[0], image.size[0])
         FovY = focal2fov(dataset.focal[0], image.size[1])
         cameras.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
-                            fid = time))
+                                  image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                                  fid = time,alpha_mask=None))
 
     return cameras
 
-def readPlenopticVideoDataset(datadir, eval, num_images, hold_id=[0]):
+
+def readPlenopticVideoDataset(datadir, eval, num_images, hold_id=[0], skip_train=False):
 
     # loading all the data follow hexplane format
     ply_path = os.path.join(datadir, "points3D_downsample2.ply")
@@ -595,136 +632,112 @@ def readPlenopticVideoDataset(datadir, eval, num_images, hold_id=[0]):
     print("Find:", ply_path, "PCD:", pcd.points.shape)
 
     from scene.neu3d import Neural3D_NDC_Dataset
-    train_dataset = Neural3D_NDC_Dataset(
-    datadir,
-    "train",
-    1.0,
-    time_scale=1,
-    scene_bbox_min=[-2.5, -2.0, -1.0],
-    scene_bbox_max=[2.5, 2.0, 1.0],
-    eval_index=0,
-        )    
-    test_dataset = Neural3D_NDC_Dataset(
-    datadir,
-    "test",
-    1.0,
-    time_scale=1,
-    scene_bbox_min=[-2.5, -2.0, -1.0],
-    scene_bbox_max=[2.5, 2.0, 1.0],
-    eval_index=0,
+    if not skip_train:
+        train_dataset = Neural3D_NDC_Dataset(
+            datadir,
+            "train",
+            1.0,
+            time_scale=1,
+            scene_bbox_min=[-2.5, -2.0, -1.0],
+            scene_bbox_max=[2.5, 2.0, 1.0],
+            eval_index=0,
+            maxt=1.0
         )
-    train_cam_infos = format_infos(train_dataset)
+        train_cam_infos = format_infos(train_dataset)
+
+        init_cam_infos = Neural3D_NDC_Dataset(
+            datadir,
+            "train",
+            1.0,
+            time_scale=1,
+            scene_bbox_min=[-2.5, -2.0, -1.0],
+            scene_bbox_max=[2.5, 2.0, 1.0],
+            eval_index=0,
+            maxt=0.0
+        )
+        init_cam_infos = format_infos(init_cam_infos)
+    else:
+        train_cam_infos = []
+        init_cam_infos = []
+    test_dataset = Neural3D_NDC_Dataset(
+        datadir,
+        "test",
+        1.0,
+        time_scale=1,
+        scene_bbox_min=[-2.5, -2.0, -1.0],
+        scene_bbox_max=[2.5, 2.0, 1.0],
+        eval_index=0,
+    )
+
+
     test_cam_infos = format_infos(test_dataset)
-    nerf_normalization = getNerfppNorm(train_cam_infos)
+    if not skip_train:
+        nerf_normalization = getNerfppNorm(train_cam_infos)
+    else:
+        nerf_normalization = getNerfppNorm(test_cam_infos)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
+                           init_cameras=init_cam_infos,
                            test_cameras=test_cam_infos,
+                           val_cameras=[],
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
 
+def partnerf(path, white_background, eval, extension=".png", skip_train=False, skip_val=False, skip_test=False):
+    # print("!!!!!!!!!!!!!!!!!!")
+    if not skip_train:
+        print("Reading Training Transforms")
+        train_cam_infos_ = readCamerasFromTransforms(path, "transforms.json", white_background, extension)
+        init_cam_infos = [cam_info for cam_info in train_cam_infos_ if cam_info.fid == 0.]
+        train_cam_infos = [cam_info for cam_info in train_cam_infos_ if cam_info.fid <= 0.75]
+    else:
+        init_cam_infos = []
+        train_cam_infos = []
 
-def setup_camera(w, h, k, w2c, near=0.01, far=100):
-    fx, fy, cx, cy = k[0][0], k[1][1], k[0][2], k[1][2]
-    w2c = torch.tensor(w2c).cuda().float()
-    cam_center = torch.inverse(w2c)[:3, 3]
-    w2c = w2c.unsqueeze(0).transpose(1, 2)
-    opengl_proj = torch.tensor([[2 * fx / w, 0.0, -(w - 2 * cx) / w, 0.0],
-                                [0.0, 2 * fy / h, -(h - 2 * cy) / h, 0.0],
-                                [0.0, 0.0, far / (far - near), -(far * near) / (far - near)],
-                                [0.0, 0.0, 1.0, 0.0]]).cuda().float().unsqueeze(0).transpose(1, 2)
-    full_proj = w2c.bmm(opengl_proj)
-    cam = {"viewmatrix":w2c}
-    return cam
+    val_cam_infos = []
+    if not skip_test:
+        print("Reading Test Transforms")
+        test_cam_infos = [cam_info for cam_info in train_cam_infos_ if cam_info.fid > 0.75]
+    else:
+        test_cam_infos = []
 
-def readPanopticSports(seq_path, eval=True):
-    # 读取元数据
-    meta_path = os.path.join(seq_path, "train_meta.json")
-    with open(meta_path, 'r') as f:
-        md = json.load(f)
+    print(len(train_cam_infos), len(test_cam_infos), len(init_cam_infos))
 
-    # 初始化参数（假设与点云无关，仅需相机信息）
-    num_timesteps = len(md['fn'])
-    train_cam_infos = []
-    test_cam_infos = []
+    if not skip_train:
+        nerf_normalization = getNerfppNorm(train_cam_infos)
+    else:
+        nerf_normalization = getNerfppNorm(test_cam_infos)
 
-    # 遍历所有时间步和相机
-    for t in range(num_timesteps):
-        for c in range(len(md['fn'][t])):
-            # 解析相机参数
-            w, h = md['w'], md['h']
-            k = md['k'][t][c]
-            w2c = md['w2c'][t][c]
-
-            # 设置相机对象（需根据实际函数调整）
-            cam = setup_camera(w, h, k, w2c, near=1.0, far=5)
-
-            # 加载图像和分割掩码
-            fn = md['fn'][t][c]
-            image_path = os.path.join(seq_path, "ims", fn)
-            image = Image.open(image_path)
-            # seg_path = os.path.join(seq_path, "seg", fn.replace('.jpg', '.png'))
-            # seg = np.array(Image.open(seg_path)).astype(np.float32)
-
-            # 转换相机位姿为R, T格式
-            # R = np.array(cam.R).T  # 假设cam.R是3x3旋转矩阵
-            # T = np.array(cam.T)
-            view_matrix = cam['viewmatrix'][0].cpu().numpy().T  # [4,4]
-            R = view_matrix[:3, :3]  # Already includes GL->CV conversion
-            T = view_matrix[:3, 3]
-
-            # 计算视场角（假设k为内参矩阵）
-            fx, fy = k[0][0], k[1][1]
-            FovY = focal2fov(fy, h)
-            FovX = focal2fov(fx, w)
-
-            # 封装为CameraInfo（添加时间维度fid）
-            cam_info = CameraInfo(
-                uid=len(train_cam_infos),
-                R=R, T=T, FovY=FovY, FovX=FovX,
-                image=image, image_path=image_path,
-                image_name=fn.split('.')[0],
-                width=w, height=h,
-                fid=t / num_timesteps  # 时间归一化到[0,1)
-            )
-            train_cam_infos.append(cam_info)
-
-    # 划分训练/测试集（示例：取最后10%为测试集）
-    if eval:
-        split_idx = int(0.9 * len(train_cam_infos))
-        test_cam_infos = train_cam_infos[split_idx:]
-        train_cam_infos = train_cam_infos[:split_idx]
-
-    # 归一化场景（基于训练相机）
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-
-    ply_path = os.path.join(seq_path, "points3d.ply")
+    ply_path = os.path.join(path, "points3d.ply")
     if not os.path.exists(ply_path):
-        init_pt_cld_path = os.path.join(seq_path, "init_pt_cld.npz")
-        init_pt_cld = np.load(init_pt_cld_path)["data"]
-        points = init_pt_cld[:, :3]
-        colors = init_pt_cld[:, 3:6]
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 50_000
+        print(f"Generating random point cloud ({num_pts}) [BLENDER]...")
 
-        pcd = BasicPointCloud(
-            points=points,
-            colors=colors,
-            normals=np.zeros_like(points)
-        )
-        storePly(ply_path, points, colors)
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3))
+        xyz[..., 0] = xyz[..., 0] * 30 - 15
+        xyz[..., 1] = xyz[..., 1] * 18 - 9
+        xyz[..., 2] = xyz[..., 2] * 7 - 3.5
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
+            shs), normals=np.zeros((num_pts, 3)))
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         pcd = fetchPly(ply_path)
     except:
         pcd = None
 
-    scene_info = SceneInfo(
-        point_cloud=pcd,
-        train_cameras=train_cam_infos,
-        test_cameras=test_cam_infos,
-        nerf_normalization=nerf_normalization,
-        ply_path=ply_path
-    )
-
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           init_cameras=init_cam_infos,
+                           val_cameras=val_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
     return scene_info
 
 
@@ -734,5 +747,5 @@ sceneLoadTypeCallbacks = {
     "DTU": readNeuSDTUInfo,  # DTU dataset used in Tensor4D [https://github.com/DSaurus/Tensor4D]
     "nerfies": readNerfiesInfo,  # NeRFies & HyperNeRF dataset proposed by [https://github.com/google/hypernerf/releases/tag/v0.1]
     "plenopticVideo": readPlenopticVideoDataset,  # Neural 3D dataset in [https://github.com/facebookresearch/Neural_3D_Video]
-    "PanopticSports": readPanopticSports,
+    "partnerf": partnerf,
 }
