@@ -21,8 +21,6 @@ ParticleGS learns physical motion directly from multi-view videos without predef
 2. **Neural ODE Dynamics Evolver** — learns continuous-time, higher-order latent particle dynamics and integrates them with an RK4 solver.
 3. **Gaussian Kernel Space Decoder** — converts evolved particle states into translation, rotation, scale, and appearance-preserving Gaussian deformation for rendering.
 
-The training schedule progressively performs geometry warm-up, dynamics warm-up, and joint optimization. In the paper, the first 75% of frames are used for reconstruction training and the remaining 25% for future-motion extrapolation testing.
-
 ## Installation
 
 ### Requirements
