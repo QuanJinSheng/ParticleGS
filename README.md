@@ -2,7 +2,7 @@
 
 ### Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation
 
-Official implementation of the CVPR 2026 paper:
+Implementation of the CVPR 2026 paper:
 
 > **ParticleGS: Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation**<br>
 > Jinsheng Quan, Qiaowei Miao, Yichao Xu, Zizhuo Lin, Ying Li, Wei Yang, Zhihui Li, Yawei Luo†<br>
