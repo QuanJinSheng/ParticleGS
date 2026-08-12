@@ -1,10 +1,10 @@
-# ParticleGS
+# ParticleGS(CVPR 2026 HighLight)
 
 ### Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation
 
 Implementation of the paper:
 
-> **ParticleGS: Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation** (HighLight)<br>
+> **ParticleGS: Learning Neural Gaussian Particle Dynamics from Videos for Prior-free Physical Motion Extrapolation**<br>
 > Jinsheng Quan, Qiaowei Miao, Yichao Xu, Zizhuo Lin, Ying Li, Wei Yang, Zhihui Li, Yawei Luo†<br>
 > Zhejiang University, North China University of Technology, Huazhong University of Science and Technology, and University of Science and Technology of China<br>
 > † Corresponding author.
