@@ -9,6 +9,7 @@ Implementation of the paper:
 > Zhejiang University, North China University of Technology, Huazhong University of Science and Technology, and University of Science and Technology of China<br>
 > † Corresponding author.
 
+[[Project]([https://openaccess.thecvf.com/content/CVPR2026/papers/Quan_ParticleGS_Learning_Neural_Gaussian_Particle_Dynamics_from_Videos_for_Prior-free_CVPR_2026_paper.pdf](https://quanjinsheng.github.io/ParticleGS/))]
 [[Paper](https://openaccess.thecvf.com/content/CVPR2026/papers/Quan_ParticleGS_Learning_Neural_Gaussian_Particle_Dynamics_from_Videos_for_Prior-free_CVPR_2026_paper.pdf)]
 
 ![ParticleGS teaser](assets/teaser.png)
